@@ -1,0 +1,125 @@
+name: MVP WRITE V1 RC
+
+on:
+  push:
+    branches: [ "rc/mvp-write-v1" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: https://github.com/moryoav/home-assistant-codex.git
+  UPSTREAM_TAG: v0.1.70
+  UPSTREAM_SHA: 06ee7b0b77455119a0ffcbc79217e6ccda8a7128
+  HA_REPO: https://github.com/home-assistant/core.git
+  HA_TAG: 2026.9.4
+  HA_SHA: 9212531f40a0b7b23229a90d688dd79d9dfccff4
+
+jobs:
+  pins:
+    name: Verify upstream pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Home Assistant Codex pin
+        run: |
+          git ls-remote "$UPSTREAM_REPO" "refs/tags/$UPSTREAM_TAG" | tee /tmp/upstream.txt
+          test "$(cut -f1 /tmp/upstream.txt)" = "$UPSTREAM_SHA"
+      - name: Verify Home Assistant Core pin
+        run: |
+          git ls-remote "$HA_REPO" "refs/tags/$HA_TAG" | tee /tmp/ha.txt
+          test "$(cut -f1 /tmp/ha.txt)" = "$HA_SHA"
+      - name: Record pin manifest
+        run: |
+          mkdir -p build
+          printf 'upstream_tag=%s\nupstream_sha=%s\nha_tag=%s\nha_sha=%s\n' "$UPSTREAM_TAG" "$UPSTREAM_SHA" "$HA_TAG" "$HA_SHA" > build/pins.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc-pin-manifest
+          path: build/pins.txt
+
+  patch-gate:
+    name: Patch import gate
+    needs: pins
+    runs-on: ubuntu-latest
+    outputs:
+      patch_present: ${{ steps.patch.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check MVP patch presence and checksum
+        id: patch
+        shell: bash
+        run: |
+          if [[ -s patches/mvp-write-v1.patch && -f patches/mvp-write-v1.sha256 ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            (cd patches && sha256sum -c mvp-write-v1.sha256)
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Release-gate status
+        run: |
+          if [[ "${{ steps.patch.outputs.present }}" != "true" ]]; then
+            printf 'RELEASE_GATE=WAITING_FOR_MVP_PATCH\nPRODUCTION_DEPLOYMENT=FORBIDDEN\n' | tee release-gate.txt
+          else
+            printf 'RELEASE_GATE=PATCH_READY\nPRODUCTION_DEPLOYMENT=FORBIDDEN_UNTIL_FULL_RC\n' | tee release-gate.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-release-gate
+          path: release-gate.txt
+
+  rc:
+    name: Full RC contract/build gate
+    needs: patch-gate
+    if: needs.patch-gate.outputs.patch_present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned upstream
+        run: |
+          git clone --filter=blob:none "$UPSTREAM_REPO" upstream
+          cd upstream
+          git checkout --detach "$UPSTREAM_SHA"
+          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
+      - name: Apply MVP WRITE V1 patch
+        run: git -C upstream apply --index ../patches/mvp-write-v1.patch
+      - name: Checkout pinned Home Assistant Core
+        run: |
+          git clone --filter=blob:none "$HA_REPO" ha-core
+          cd ha-core
+          git checkout --detach "$HA_SHA"
+          test "$(git rev-parse HEAD)" = "$HA_SHA"
+      - name: Prepare test environment
+        run: |
+          python -m pip install --upgrade pip
+          if [[ -f upstream/requirements_test.txt ]]; then pip install -r upstream/requirements_test.txt; fi
+          if [[ -f upstream/requirements.txt ]]; then pip install -r upstream/requirements.txt; fi
+      - name: Run imported MVP tests
+        run: |
+          if [[ -d upstream/tests ]]; then python -m pytest -q upstream/tests; fi
+          if [[ -d rc-tests ]]; then python -m pytest -q rc-tests; fi
+      - name: Require real RC harness
+        run: |
+          test -f rc-tests/test_core_contract.py
+          test -f rc-tests/test_endpoint_contract.py
+          test -f rc-tests/test_recovery.py
+      - name: Build worker image
+        run: |
+          docker build -t ha-codex-write:0.1.70-write1-rc1 upstream/codex-cli-worker
+          docker image inspect ha-codex-write:0.1.70-write1-rc1 --format '{{.Id}}' | tee worker-image-id.txt
+      - name: Worker image smoke test
+        run: docker image inspect ha-codex-write:0.1.70-write1-rc1 >/dev/null
+      - name: Create RC evidence
+        run: |
+          mkdir -p build
+          cp worker-image-id.txt build/
+          git -C upstream diff --cached --binary > build/applied-mvp.patch
+          sha256sum build/* > build/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvp-write-v1-rc-evidence
+          path: build/

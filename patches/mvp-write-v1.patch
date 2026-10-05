@@ -1,0 +1,1377 @@
+diff --git a/codex-cli-worker/server.py b/codex-cli-worker/server.py
+index 4b33487..b5fa56b 100644
+--- a/codex-cli-worker/server.py
++++ b/codex-cli-worker/server.py
+@@ -103,6 +103,7 @@ DEFAULT_OPTIONS = {
+     "notify_service": "",
+     "task_timeout_seconds": 3600,
+     "auto_save_lovelace": True,
++    "mvp_write_scopes": ["READ"],
+     "config_check": True,
+     "full_snapshot": False,
+     "backup_retention_days": 7,
+diff --git a/codex-cli-worker/verification.py b/codex-cli-worker/verification.py
+index 4141a0d..468ae2e 100644
+--- a/codex-cli-worker/verification.py
++++ b/codex-cli-worker/verification.py
+@@ -28,6 +28,9 @@ ENTITY_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+ PATH_RE = re.compile(r"/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?/?")
+ 
+ 
++from write_broker import WriteBroker
++
++
+ class Verification:
+     """Run the bounded checks a running task may request with its capability, and record them on its current turn."""
+ 
+@@ -37,6 +40,7 @@ class Verification:
+         self.capabilities = {}
+         self.lock = threading.RLock()
+         self.execution_lock = threading.Lock()
++        self.write_broker = WriteBroker(worker, self.core)
+ 
+     def begin(self, task_id):
+         """Issue a new capability for the task's turn, clear its recorded checks, and delete expired screenshots."""
+@@ -44,6 +48,10 @@ class Verification:
+         with self.lock:
+             capability = secrets.token_urlsafe(32)
+             self.capabilities[task_id] = capability
++        with self.worker.lock:
++            turn_id = self.worker.tasks.get(task_id, {}).get("current_turn_id")
++        scopes = self.worker.read_options().get("mvp_write_scopes", ["READ"])
++        self.write_broker.begin(task_id, turn_id, scopes)
+         self.worker.update_task(task_id, verification=[], verification_attachments=[])
+         return capability
+ 
+@@ -51,6 +59,7 @@ class Verification:
+         """Withdraw the task's capability so later requests that present it are refused."""
+         with self.lock:
+             self.capabilities.pop(task_id, None)
++            self.write_broker.end(task_id)
+ 
+     def dispatch(self, payload):
+         """Run a request's check for the running task that owns its capability; raise ValueError if there is none."""
+@@ -67,6 +76,14 @@ class Verification:
+         with self.worker.lock:
+             if self.worker.tasks.get(task_id, {}).get("status") != "running":
+                 raise ValueError("Verification capability expired")
++        if "tool" in payload:
++            if set(payload) != {"tool", "arguments", "capability"} or not isinstance(payload["arguments"], dict):
++                raise ValueError("Invalid MVP request")
++            arguments = dict(payload["arguments"])
++            dry_run = arguments.pop("dry_run", False)
++            with self.execution_lock:
++                outcome = self.write_broker.execute(task_id, payload["tool"], arguments, dry_run)
++            return json.loads(self.worker.redact(json.dumps(outcome)))
+         return self.run(task_id, {k: v for k, v in payload.items() if k != "capability"}, supplied)
+ 
+     def active(self, task_id, turn_id, capability):
+diff --git a/codex-cli-worker/verification_mcp.py b/codex-cli-worker/verification_mcp.py
+index 73d7e9a..20b4589 100644
+--- a/codex-cli-worker/verification_mcp.py
++++ b/codex-cli-worker/verification_mcp.py
+@@ -5,6 +5,7 @@ import json
+ import os
+ import socket
+ import sys
++from write_mcp import TOOLS, SCHEMAS
+ 
+ TOOL = {
+     "name": "verify",
+@@ -28,13 +29,15 @@ TOOL = {
+ }
+ 
+ 
+-def verify(arguments):
++def verify(arguments, tool="verify"):
+     """Forward only the supported fields and the process's temporary capability."""
+-    if not isinstance(arguments, dict) or set(arguments) - set(TOOL["inputSchema"]["properties"]):
++    schema = TOOL["inputSchema"] if tool == "verify" else SCHEMAS.get(tool)
++    if schema is None or not isinstance(arguments, dict) or set(arguments) - set(schema["properties"]):
+         raise ValueError("Unsupported verification arguments")
+-    if arguments.get("operation") not in TOOL["inputSchema"]["properties"]["operation"]["enum"]:
++    if tool == "verify" and arguments.get("operation") not in TOOL["inputSchema"]["properties"]["operation"]["enum"]:
+         raise ValueError("Unsupported verification operation")
+-    payload = {**arguments, "capability": os.environ.get("HA_VERIFICATION_CAPABILITY", "")}
++    payload = ({**arguments} if tool == "verify" else {"tool": tool, "arguments": arguments})
++    payload["capability"] = os.environ.get("HA_VERIFICATION_CAPABILITY", "")
+     encoded = json.dumps(payload).encode() + b"\n"
+     if len(encoded) > 16384:
+         raise ValueError("Verification request is too large")
+@@ -58,13 +61,13 @@ def respond(request):
+     if method == "ping":
+         return {}
+     if method == "tools/list":
+-        return {"tools": [TOOL]}
++        return {"tools": [TOOL, *TOOLS]}
+     if method == "tools/call":
+         params = request.get("params", {})
+         try:
+-            if params.get("name") != TOOL["name"]:
++            if params.get("name") not in {TOOL["name"], *SCHEMAS}:
+                 raise ValueError("Unknown verification tool")
+-            result = verify(params.get("arguments", {}))
++            result = verify(params.get("arguments", {}), params["name"])
+         except (OSError, ValueError, TypeError):
+             result = {"status": "unavailable", "message": "Verification request failed or the task has ended"}
+         return {"content": [{"type": "text", "text": json.dumps(result)}],
+diff --git a/codex-cli-worker/write_audit.py b/codex-cli-worker/write_audit.py
+new file mode 100644
+index 0000000..9bf96dc
+--- /dev/null
++++ b/codex-cli-worker/write_audit.py
+@@ -0,0 +1,47 @@
++"""Bounded audit output: fixed keys, no payloads/credentials or exception text."""
++import json
++import logging
++from logging.handlers import RotatingFileHandler
++from datetime import datetime, timezone
++from pathlib import Path
++import os
++
++class PrivateRotatingHandler(RotatingFileHandler):
++    def _open(self):
++        fd = os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
++        return os.fdopen(fd, 'a', encoding='utf-8')
++
++class Audit:
++    def __init__(self, directory):
++        directory = Path(directory)
++        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
++        path = directory / 'write-v1.jsonl'
++        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
++        os.close(fd)
++        os.chmod(path, 0o600)
++        self.handler = PrivateRotatingHandler(path, maxBytes=1024*1024, backupCount=4, encoding='utf-8', delay=True)
++        self.handler.setFormatter(logging.Formatter('%(message)s'))
++
++    def emit(self, stage, request, outcome=None):
++        row = {'timestamp': datetime.now(timezone.utc).isoformat(), 'stage': stage,
++               **{k: request.get(k) for k in ('operation_id', 'task_id', 'turn_id', 'operation', 'scope', 'target')},
++               'result': outcome.get('status') if outcome else None,
++               'verified': outcome.get('verified', False) if outcome else False}
++        # Explicit emit/flush rather than logging.handleError (which can hide I/O failures).
++        encoded = json.dumps(row, ensure_ascii=False)
++        self.handler.acquire()
++        try:
++            if self.handler.stream is None:
++                self.handler.stream = self.handler._open()
++            record = logging.LogRecord('write-v1', logging.INFO, '', 0, encoded, (), None)
++            if self.handler.shouldRollover(record):
++                self.handler.doRollover()
++                if self.handler.stream is None:
++                    self.handler.stream = self.handler._open()
++            self.handler.stream.write(encoded + '\n')
++            self.handler.flush()
++        finally:
++            self.handler.release()
++
++    def close(self):
++        self.handler.close()
+diff --git a/codex-cli-worker/write_broker.py b/codex-cli-worker/write_broker.py
+new file mode 100644
+index 0000000..6c3a890
+--- /dev/null
++++ b/codex-cli-worker/write_broker.py
+@@ -0,0 +1,80 @@
++"""Task-scoped, default-deny broker owned by the worker (never the model)."""
++import secrets
++import time
++from write_contract import SCOPES, PROTOCOL, validate, target_for, digest, signature, result, Denied, Invalid
++from write_audit import Audit
++
++class WriteBroker:
++    def __init__(self, worker, core_call, clock=time.time):
++        self.worker, self.core_call, self.clock = worker, core_call, clock
++        self.grants = {}
++        self.audit = None
++
++    def begin(self, task_id, turn_id, scopes):
++        if not isinstance(scopes, list) or set(scopes) - {'READ', 'WRITE_REGISTRY', 'WRITE_SERVICE'}:
++            raise ValueError('Invalid configured scopes')
++        self.grants[task_id] = (turn_id, frozenset(scopes))
++
++    def end(self, task_id):
++        self.grants.pop(task_id, None)
++
++    def execute(self, task_id, tool, payload, dry_run=False):
++        with self.worker.lock:
++            task = self.worker.tasks.get(task_id, {})
++            turn_id = task.get('current_turn_id')
++            grant = self.grants.get(task_id)
++            active = task.get('status') == 'running' and not self.worker.task_cancellation_requested(task_id)
++        r = {'protocol_version': PROTOCOL, 'operation_id': secrets.token_hex(16), 'task_id': task_id,
++             'turn_id': turn_id, 'operation': tool, 'scope': SCOPES.get(tool), 'target': None,
++             'payload': payload, 'dry_run': dry_run}
++        if not active or not grant or grant[0] != turn_id or SCOPES.get(tool) not in grant[1]:
++            return self.rejected(r, 'PERMISSION_DENIED')
++        try:
++            validate(tool, payload, dry_run)
++            r['target'] = target_for(tool, payload)
++        except Denied:
++            return self.rejected(r, 'PERMISSION_DENIED')
++        except (Invalid, TypeError):
++            return self.rejected(r, 'VALIDATION_ERROR')
++        secret = self.worker.api_token()
++        if not secret:
++            return self.rejected(r, 'PERMISSION_DENIED')
++        claims = {'task_id': task_id, 'turn_id': turn_id, 'operation_id': r['operation_id'],
++                  'allowed_operation': tool, 'allowed_target': r['target'], 'scope': r['scope'],
++                  'expiration': self.clock()+30, 'nonce': secrets.token_hex(16), 'request_digest': digest(r)}
++        proof = {'claims': claims, 'signature': signature(secret, claims)}
++        try:
++            if self.audit is None:
++                self.audit = Audit(self.worker.DATA_ROOT / 'write_audit')
++            self.audit.emit('START', r)
++        except Exception:
++            return result(r, 'WRITE_FAILED', warnings=['Worker audit unavailable; request not sent'])
++        try:
++            # Fixed endpoint, credentials added inside the existing trusted core() helper.
++            response = self.core_call('POST', 'codex_cli/write_operation', json={**r, 'authorization': proof})
++            if not isinstance(response, dict) or response.get('operation_id') != r['operation_id'] or response.get('tool') != tool or response.get('target') != r['target']:
++                response = result(r, 'VERIFY_FAILED', warnings=['Backend response mismatch'])
++            # Project only contract fields. Never forward backend credentials/exception details.
++            allowed = set(result(r, 'SUCCESS'))
++            response = {k: v for k, v in response.items() if k in allowed}
++            response = self.worker.redact_json_result(response) if hasattr(self.worker, 'redact_json_result') else response
++        except Exception:
++            response = result(r, 'WRITE_FAILED', warnings=['Backend unavailable; execution outcome unknown; do not retry blindly'])
++        try:
++            self.audit.emit('RESULT', r, response)
++        except Exception:
++            return result(r, 'VERIFY_FAILED', warnings=['Worker result audit failed; execution may have occurred'])
++        return response
++
++    def rejected(self, request, status):
++        outcome = result(request, status)
++        safe = {k: request.get(k) for k in ('operation_id', 'task_id', 'turn_id')}
++        safe['operation'] = request['operation'] if request['operation'] in SCOPES else 'rejected_request'
++        try:
++            if self.audit is None:
++                self.audit = Audit(self.worker.DATA_ROOT / 'write_audit')
++            self.audit.emit('START', safe)
++            self.audit.emit('RESULT', safe, outcome)
++        except Exception:
++            pass  # Failure cannot change the denial into an allowed operation.
++        return outcome
+diff --git a/codex-cli-worker/write_contract.py b/codex-cli-worker/write_contract.py
+new file mode 100644
+index 0000000..56297ed
+--- /dev/null
++++ b/codex-cli-worker/write_contract.py
+@@ -0,0 +1,144 @@
++"""Strict MVP wire contract; shared verbatim with the trusted worker."""
++import hashlib
++import hmac
++import json
++import re
++import unicodedata
++
++PROTOCOL = 1
++SCOPES = {
++    'ha_area_create': 'WRITE_REGISTRY',
++    'ha_area_update': 'WRITE_REGISTRY',
++    'ha_area_get_environment_entities': 'READ',
++    'ha_area_set_temperature_entity': 'WRITE_REGISTRY',
++    'ha_service_call': 'WRITE_SERVICE',
++}
++FIELDS = {
++    'ha_area_create': ({'name'}, {'name', 'floor_id', 'icon', 'aliases'}),
++    'ha_area_update': ({'area_id'}, {'area_id', 'name', 'floor_id', 'icon', 'aliases'}),
++    'ha_area_get_environment_entities': ({'area_id'}, {'area_id'}),
++    'ha_area_set_temperature_entity': ({'area_id', 'entity_id'}, {'area_id', 'entity_id'}),
++    'ha_service_call': ({'domain', 'service', 'target'}, {'domain', 'service', 'target', 'data'}),
++}
++
++class Invalid(ValueError):
++    """Input cannot be executed."""
++
++class Denied(ValueError):
++    """Authorization cannot be accepted."""
++
++def canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
++
++def normalized(name):
++    return ' '.join(unicodedata.normalize('NFKC', name).split()).casefold()
++
++def text(value):
++    if not isinstance(value, str) or not value.strip() or len(value) > 128 or any(ord(c) < 32 for c in value):
++        raise Invalid('Invalid bounded string')
++
++def identifier(value):
++    if not isinstance(value, str) or not re.fullmatch(r'[a-z0-9_]{1,128}', value):
++        raise Invalid('Invalid registry identifier')
++
++def validate(operation, payload, dry_run):
++    if operation not in SCOPES:
++        raise Denied('Unknown operation')
++    if not isinstance(payload, dict) or type(dry_run) is not bool:
++        raise Invalid('Invalid request shape')
++    required, allowed = FIELDS[operation]
++    if required - payload.keys() or payload.keys() - allowed:
++        raise Invalid('Missing or forbidden fields')
++    if 'name' in payload:
++        text(payload['name'])
++    for key in ('area_id', 'floor_id'):
++        if key in payload and not (key == 'floor_id' and payload[key] is None):
++            identifier(payload[key])
++    if 'icon' in payload and payload['icon'] is not None:
++        if not isinstance(payload['icon'], str) or not re.fullmatch(r'mdi:[a-z0-9-]{1,80}', payload['icon']):
++            raise Invalid('Invalid icon')
++    if 'aliases' in payload and payload['aliases'] is not None:
++        if not isinstance(payload['aliases'], list) or len(payload['aliases']) > 32:
++            raise Invalid('Invalid aliases')
++        for alias in payload['aliases']:
++            text(alias)
++    if 'entity_id' in payload:
++        if not isinstance(payload['entity_id'], str) or not re.fullmatch(r'sensor\.[a-z0-9_]{1,128}', payload['entity_id']):
++            raise Invalid('Invalid sensor entity')
++    if operation == 'ha_service_call':
++        if (payload['domain'], payload['service']) != ('update', 'install'):
++            raise Denied('Service is not allowlisted')
++        if payload['target'] != {'entity_id': 'update.codex_update'}:
++            raise Denied('Target is not allowlisted')
++        data = payload.get('data', {})
++        if not isinstance(data, dict) or set(data) - {'version'}:
++            raise Invalid('Forbidden service data')
++        # Pin MVP to the approved upstream build; cannot install a future/unreviewed version.
++        if data.get('version', '0.1.70') not in ('0.1.70', 'v0.1.70'):
++            raise Denied('Version is not allowlisted')
++
++def target_for(operation, payload):
++    if operation == 'ha_area_create':
++        return {'normalized_name': normalized(payload['name'])}
++    if operation == 'ha_service_call':
++        return {'entity_id': 'update.codex_update'}
++    return {'area_id': payload['area_id']}
++
++REQUEST_KEYS = {'protocol_version', 'operation_id', 'task_id', 'turn_id', 'operation', 'scope', 'target', 'payload', 'dry_run'}
++
++def digest(request):
++    return hashlib.sha256(canonical(request)).hexdigest()
++
++def signature(secret, claims):
++    key = hmac.new(secret.encode(), b'codex-cli/write-v1', hashlib.sha256).digest()
++    return hmac.new(key, canonical(claims), hashlib.sha256).hexdigest()
++
++def authorize(request, proof, secret, now, seen):
++    if set(request) != REQUEST_KEYS or request.get('protocol_version') != PROTOCOL:
++        raise Invalid('Unsupported protocol or request shape')
++    validate(request['operation'], request['payload'], request['dry_run'])
++    for key in ('task_id', 'turn_id', 'operation_id'):
++        text(request[key])
++    if request['scope'] != SCOPES[request['operation']] or request['target'] != target_for(request['operation'], request['payload']):
++        raise Denied('Scope or target mismatch')
++    expected = {'task_id', 'turn_id', 'operation_id', 'allowed_operation', 'allowed_target', 'scope', 'expiration', 'nonce', 'request_digest'}
++    if not isinstance(proof, dict) or set(proof) != {'claims', 'signature'}:
++        raise Denied('Missing authorization')
++    claims = proof['claims']
++    if not isinstance(claims, dict) or set(claims) != expected:
++        raise Denied('Invalid authorization shape')
++    try:
++        valid_signature = hmac.compare_digest(signature(secret, claims), proof['signature'])
++    except (TypeError, ValueError):
++        raise Denied('Invalid authorization') from None
++    if not valid_signature:
++        raise Denied('Invalid authorization')
++    expiration = claims['expiration']
++    if type(expiration) not in (int, float) or not now < expiration <= now + 60:
++        raise Denied('Expired or excessive authorization lifetime')
++    checks = {'task_id': request['task_id'], 'turn_id': request['turn_id'], 'operation_id': request['operation_id'],
++              'allowed_operation': request['operation'], 'allowed_target': request['target'],
++              'scope': request['scope'], 'request_digest': digest(request)}
++    if any(claims[k] != v for k, v in checks.items()):
++        raise Denied('Authorization binding mismatch')
++    nonce = claims['nonce']
++    if not isinstance(nonce, str) or not re.fullmatch(r'[a-f0-9]{32}', nonce):
++        raise Denied('Invalid nonce')
++    for n, exp in list(seen.items()):
++        if exp <= now:
++            del seen[n]
++    if nonce in seen or len(seen) >= 4096:
++        raise Denied('Replay or authorization capacity exceeded')
++    seen[nonce] = expiration
++
++def result(request, status, before=None, after=None, verified=False, warnings=None):
++    # Never echo unvalidated attacker-controlled fields, even on error paths.
++    try:
++        validate(request.get('operation'), request.get('payload'), request.get('dry_run'))
++        safe_target = target_for(request['operation'], request['payload'])
++        safe_requested = request['payload']
++    except (Invalid, Denied, TypeError, KeyError):
++        safe_target, safe_requested = None, None
++    return {'status': status, 'operation_id': request.get('operation_id'), 'tool': request.get('operation'),
++            'target': safe_target, 'before': before, 'requested': safe_requested,
++            'after': after, 'verified': verified, 'restart_required': False, 'warnings': warnings or []}
+diff --git a/codex-cli-worker/write_mcp.py b/codex-cli-worker/write_mcp.py
+new file mode 100644
+index 0000000..57d16cd
+--- /dev/null
++++ b/codex-cli-worker/write_mcp.py
+@@ -0,0 +1,24 @@
++"""MVP schemas: caller cannot supply authorization, scope, URL or raw command."""
++from write_contract import SCOPES
++
++def obj(properties, required=()):
++    return {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}
++
++S = {'type': 'string'}
++NULLABLE = {'type': ['string', 'null']}
++COMMON = {'dry_run': {'type': 'boolean', 'default': False}}
++META = {'name': S, 'floor_id': NULLABLE, 'icon': NULLABLE,
++        'aliases': {'type': ['array', 'null'], 'items': S, 'maxItems': 32}}
++SCHEMAS = {
++    'ha_area_create': obj({**META, **COMMON}, ['name']),
++    'ha_area_update': obj({'area_id': S, **META, **COMMON}, ['area_id']),
++    'ha_area_get_environment_entities': obj({'area_id': S}, ['area_id']),
++    'ha_area_set_temperature_entity': obj({'area_id': S, 'entity_id': S, **COMMON}, ['area_id', 'entity_id']),
++    'ha_service_call': obj({'domain': {'const': 'update', 'type': 'string'},
++                            'service': {'const': 'install', 'type': 'string'},
++                            'target': obj({'entity_id': {'const': 'update.codex_update', 'type': 'string'}}, ['entity_id']),
++                            'data': obj({'version': {'type': 'string', 'enum': ['0.1.70', 'v0.1.70']}}), **COMMON},
++                           ['domain', 'service', 'target']),
++}
++TOOLS = [{'name': name, 'description': f'MVP fixed operation; requires {SCOPES[name]}. Dry run never mutates HA.',
++          'inputSchema': schema} for name, schema in SCHEMAS.items()]
+diff --git a/custom_components/codex_cli/__init__.py b/custom_components/codex_cli/__init__.py
+index fbd9a3e..741cec5 100644
+--- a/custom_components/codex_cli/__init__.py
++++ b/custom_components/codex_cli/__init__.py
+@@ -37,6 +37,7 @@ from .coordinator import CodexCliCoordinator
+ from .discovery import async_discover_worker
+ from .notification_actions import async_listen_for_choices
+ from .browser_auth import STORAGE_KEY, BrowserSessions, BrowserSessionView, DiagnosticView
++from .write_api import WriteOperationView, setup_backend
+ 
+ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
+ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+@@ -74,6 +75,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+     _async_register_services(hass)
+     hass.http.register_view(BrowserSessionView(hass))
+     hass.http.register_view(DiagnosticView(hass))
++    hass.http.register_view(WriteOperationView(hass))
+     return True
+ 
+ 
+@@ -96,6 +98,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+     await broker.setup()
+     hass.data.setdefault(DOMAIN, {})["browser_sessions"] = broker
+     entry.async_on_unload(broker.close)
++    entry.async_on_unload(setup_backend(hass, worker.api_token))
+     entry.async_on_unload(async_listen_for_choices(hass, client, coordinator))
+ 
+     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+diff --git a/custom_components/codex_cli/manifest.json b/custom_components/codex_cli/manifest.json
+index 5e4ab67..7fafc70 100644
+--- a/custom_components/codex_cli/manifest.json
++++ b/custom_components/codex_cli/manifest.json
+@@ -1,13 +1,19 @@
+ {
+   "domain": "codex_cli",
+   "name": "Codex",
+-  "codeowners": ["@moryoav"],
++  "codeowners": [
++    "@moryoav"
++  ],
+   "config_flow": true,
+-  "dependencies": ["hassio", "http", "persistent_notification"],
++  "dependencies": [
++    "hassio",
++    "http",
++    "persistent_notification"
++  ],
+   "documentation": "https://github.com/moryoav/home-assistant-codex",
+   "integration_type": "service",
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/moryoav/home-assistant-codex/issues",
+   "single_config_entry": true,
+-  "version": "0.1.70"
++  "version": "0.1.70+write1"
+ }
+diff --git a/custom_components/codex_cli/write_api.py b/custom_components/codex_cli/write_api.py
+new file mode 100644
+index 0000000..420575a
+--- /dev/null
++++ b/custom_components/codex_cli/write_api.py
+@@ -0,0 +1,139 @@
++"""Fixed HA adapter and admin/paired-worker endpoint; no generic proxy."""
++import hmac
++import json
++import logging
++from aiohttp import web
++from homeassistant.components.http import HomeAssistantView
++from homeassistant.components.http.const import KEY_HASS_USER
++from homeassistant.const import __version__ as HA_VERSION
++from homeassistant.helpers import area_registry as ar, floor_registry as fr, entity_registry as er, device_registry as dr
++from .const import DOMAIN
++from .write_backend import Backend
++from .write_audit import Audit
++from .write_auth import ReplayGuard
++from .write_contract import REQUEST_KEYS, result
++
++class HAAdapter:
++    def __init__(self, hass):
++        if HA_VERSION != '2026.9.4':
++            raise ValueError('MVP backend supports only tested Core 2026.9.4')
++        self.hass = hass
++        self.ar, self.fr, self.er, self.dr = ar.async_get(hass), fr.async_get(hass), er.async_get(hass), dr.async_get(hass)
++
++    @staticmethod
++    def serialize(entry):
++        if entry is None:
++            return None
++        return {'area_id': entry.id, 'name': entry.name, 'floor_id': entry.floor_id,
++                'icon': entry.icon, 'aliases': sorted(entry.aliases),
++                'temperature_entity_id': entry.temperature_entity_id,
++                'humidity_entity_id': entry.humidity_entity_id,
++                'picture': entry.picture, 'labels': sorted(entry.labels)}
++
++    def areas(self):
++        return [self.serialize(a) for a in self.ar.async_list_areas()]
++
++    def area(self, area_id):
++        return self.serialize(self.ar.async_get_area(area_id))
++
++    def floor_exists(self, floor_id):
++        return self.fr.async_get_floor(floor_id) is not None
++
++    @staticmethod
++    def kwargs(change):
++        return {k: set(v) if k == 'aliases' else v for k, v in change.items()}
++
++    def create(self, change):
++        return self.ar.async_create(**self.kwargs(change)).id
++
++    def update(self, area_id, change):
++        self.ar.async_update(area_id, **self.kwargs(change))
++
++    def candidates(self, area_id):
++        candidates = []
++        for entry in self.er.entities.values():
++            effective = er.async_get_effective_area_id(self.hass, entry)
++            if effective != area_id:
++                continue
++            state = self.hass.states.get(entry.entity_id)
++            if state is None or not entry.entity_id.startswith('sensor.'):
++                continue
++            attrs = state.attributes
++            device_class = attrs.get('device_class')
++            if device_class not in ('temperature', 'humidity', 'atmospheric_pressure', 'illuminance', 'carbon_dioxide', 'pm25', 'pm10'):
++                continue
++            device = self.dr.async_get(entry.device_id) if entry.device_id else None
++            candidates.append({'entity_id': entry.entity_id, 'device_id': entry.device_id,
++                               'device_class': device_class, 'state_class': attrs.get('state_class'),
++                               'unit': attrs.get('unit_of_measurement'), 'entity_category': entry.entity_category,
++                               'area': effective, 'entity_area': entry.area_id,
++                               'device_area': dr.async_get_effective_area_id(self.hass, device) if device else None,
++                               'diagnostic': entry.entity_category == 'diagnostic' or 'device_temperature' in entry.entity_id,
++                               'state_available': state.state not in ('unknown', 'unavailable')})
++        return candidates
++
++    def update_state(self):
++        entry = self.er.async_get('update.codex_update')
++        # Do not act on a renamed/spoofed update entity belonging to another integration.
++        if entry is None or entry.platform != 'hacs' or entry.unique_id != '1251200641':
++            return None
++        state = self.hass.states.get('update.codex_update')
++        if state is None or state.state not in ('on', 'off'):
++            return None
++        return {k: state.attributes.get(k) for k in ('installed_version', 'latest_version')}
++
++    async def install_update(self, version):
++        await self.hass.services.async_call('update', 'install', {'version': version}, blocking=True,
++                                            target={'entity_id': 'update.codex_update'})
++
++class WriteOperationView(HomeAssistantView):
++    url = '/api/codex_cli/write_operation'
++    name = 'api:codex_cli:write_operation'
++    requires_auth = True
++
++    def __init__(self, hass):
++        self.hass = hass
++
++    async def post(self, request):
++        user = request.get(KEY_HASS_USER)
++        backend = self.hass.data.get(DOMAIN, {}).get('write_backend')
++        if backend is None:
++            raise web.HTTPServiceUnavailable()
++        if user is None or not user.is_admin:
++            raise web.HTTPForbidden()
++        raw = bytearray()
++        async for chunk in request.content.iter_chunked(1024):
++            raw.extend(chunk)
++            if len(raw) > 16384:
++                raise web.HTTPRequestEntityTooLarge(max_size=16384, actual_size=len(raw))
++        try:
++            body = json.loads(raw)
++        except (ValueError, UnicodeError):
++            raise web.HTTPBadRequest() from None
++        if not isinstance(body, dict) or set(body) != REQUEST_KEYS | {'authorization', 'worker_token'}:
++            raise web.HTTPBadRequest()
++        token = body.pop('worker_token')
++        if not isinstance(token, str) or not hmac.compare_digest(token.encode(), backend.secret.encode()):
++            raise web.HTTPForbidden()
++        proof = body.pop('authorization')
++        outcome = await backend.execute(body, proof)
++        return self.json(outcome, headers={'Cache-Control': 'no-store'})
++
++def setup_backend(hass, secret):
++    audit = None
++    try:
++        adapter = HAAdapter(hass)
++        audit = Audit(hass.config.path('codex_write_audit'))
++        backend = Backend(adapter, secret, audit)
++        backend.seen = ReplayGuard(hass.config.path('codex_write_audit'))
++    except Exception:
++        if audit is not None:
++            audit.close()
++        # Write extension unavailable must not break the existing read/pairing integration.
++        logging.getLogger(__name__).warning('MVP write backend unavailable; existing read integration remains enabled')
++        return lambda: None
++    hass.data.setdefault(DOMAIN, {})['write_backend'] = backend
++    def close():
++        hass.data[DOMAIN].pop('write_backend', None)
++        audit.close()
++    return close
+diff --git a/custom_components/codex_cli/write_audit.py b/custom_components/codex_cli/write_audit.py
+new file mode 100644
+index 0000000..9bf96dc
+--- /dev/null
++++ b/custom_components/codex_cli/write_audit.py
+@@ -0,0 +1,47 @@
++"""Bounded audit output: fixed keys, no payloads/credentials or exception text."""
++import json
++import logging
++from logging.handlers import RotatingFileHandler
++from datetime import datetime, timezone
++from pathlib import Path
++import os
++
++class PrivateRotatingHandler(RotatingFileHandler):
++    def _open(self):
++        fd = os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
++        return os.fdopen(fd, 'a', encoding='utf-8')
++
++class Audit:
++    def __init__(self, directory):
++        directory = Path(directory)
++        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
++        path = directory / 'write-v1.jsonl'
++        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
++        os.close(fd)
++        os.chmod(path, 0o600)
++        self.handler = PrivateRotatingHandler(path, maxBytes=1024*1024, backupCount=4, encoding='utf-8', delay=True)
++        self.handler.setFormatter(logging.Formatter('%(message)s'))
++
++    def emit(self, stage, request, outcome=None):
++        row = {'timestamp': datetime.now(timezone.utc).isoformat(), 'stage': stage,
++               **{k: request.get(k) for k in ('operation_id', 'task_id', 'turn_id', 'operation', 'scope', 'target')},
++               'result': outcome.get('status') if outcome else None,
++               'verified': outcome.get('verified', False) if outcome else False}
++        # Explicit emit/flush rather than logging.handleError (which can hide I/O failures).
++        encoded = json.dumps(row, ensure_ascii=False)
++        self.handler.acquire()
++        try:
++            if self.handler.stream is None:
++                self.handler.stream = self.handler._open()
++            record = logging.LogRecord('write-v1', logging.INFO, '', 0, encoded, (), None)
++            if self.handler.shouldRollover(record):
++                self.handler.doRollover()
++                if self.handler.stream is None:
++                    self.handler.stream = self.handler._open()
++            self.handler.stream.write(encoded + '\n')
++            self.handler.flush()
++        finally:
++            self.handler.release()
++
++    def close(self):
++        self.handler.close()
+diff --git a/custom_components/codex_cli/write_auth.py b/custom_components/codex_cli/write_auth.py
+new file mode 100644
+index 0000000..7268411
+--- /dev/null
++++ b/custom_components/codex_cli/write_auth.py
+@@ -0,0 +1,50 @@
++"""Bounded durable nonce replay guard, private to integration backend."""
++from collections.abc import MutableMapping
++import json
++import os
++from pathlib import Path
++import tempfile
++import time
++
++class ReplayGuard(MutableMapping):
++    def __init__(self, directory, clock=time.time):
++        self.path = Path(directory) / 'replay-v1.json'
++        self.clock = clock
++        self.data = {}
++        if self.path.exists():
++            loaded = json.loads(self.path.read_text())
++            if not isinstance(loaded, dict) or len(loaded) > 4096:
++                raise ValueError('Invalid replay journal')
++            self.data = {k: v for k, v in loaded.items() if type(v) in (int, float) and v > clock()}
++
++    def __getitem__(self, key):
++        return self.data[key]
++
++    def __iter__(self):
++        return iter(self.data)
++
++    def __len__(self):
++        return len(self.data)
++
++    def __setitem__(self, key, value):
++        data = {k: v for k, v in self.data.items() if v > self.clock()}
++        data[key] = value
++        self._save(data)
++        self.data = data
++
++    def __delitem__(self, key):
++        # Expired entries need no durable removal; next insertion prunes journal.
++        del self.data[key]
++
++    def _save(self, data):
++        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++        fd, tmp = tempfile.mkstemp(dir=self.path.parent)
++        try:
++            with os.fdopen(fd, 'w') as stream:
++                json.dump(data, stream, sort_keys=True)
++                stream.flush()
++                os.fsync(stream.fileno())
++            os.replace(tmp, self.path)
++        finally:
++            if os.path.exists(tmp):
++                os.unlink(tmp)
+diff --git a/custom_components/codex_cli/write_backend.py b/custom_components/codex_cli/write_backend.py
+new file mode 100644
+index 0000000..981aa31
+--- /dev/null
++++ b/custom_components/codex_cli/write_backend.py
+@@ -0,0 +1,124 @@
++"""HA-native MVP operations; execute only in the Home Assistant event loop."""
++import asyncio
++import time
++from .write_contract import Invalid, Denied, authorize, result, normalized
++
++class Backend:
++    def __init__(self, adapter, secret, audit, clock=time.time):
++        self.adapter, self.secret, self.audit, self.clock = adapter, secret, audit, clock
++        self.seen = {}
++        self.lock = asyncio.Lock()
++
++    async def execute(self, request, proof):
++        async with self.lock:
++            try:
++                authorize(request, proof, self.secret, self.clock(), self.seen)
++                self.audit.emit('START', request)
++            except Denied:
++                return self._rejected(request, 'PERMISSION_DENIED')
++            except Invalid:
++                return self._rejected(request, 'VALIDATION_ERROR')
++            except Exception:
++                return result(request, 'WRITE_FAILED', warnings=['Audit unavailable; no mutation performed'])
++            try:
++                outcome = await self._perform(request)
++            except (Invalid, ValueError, KeyError):
++                outcome = result(request, 'VALIDATION_ERROR')
++            except Exception:
++                # Exception strings can contain credentials or service data.
++                outcome = result(request, 'WRITE_FAILED', warnings=['Backend failure; read-back required before retry'])
++            try:
++                self.audit.emit('RESULT', request, outcome)
++            except Exception:
++                outcome = result(request, 'VERIFY_FAILED', warnings=['Result audit failed; mutation may have occurred'])
++            return outcome
++
++    def _rejected(self, request, status):
++        outcome = result(request, status)
++        # Unauthenticated identity/targets must not be copied to the audit sink.
++        safe = {'operation': 'rejected_request'}
++        try:
++            self.audit.emit('START', safe)
++            self.audit.emit('RESULT', safe, outcome)
++        except Exception:
++            pass  # Denial is fail-closed even when audit is unavailable.
++        return outcome
++
++    async def _perform(self, r):
++        p, operation = r['payload'], r['operation']
++        if operation == 'ha_service_call':
++            before = self.adapter.update_state()
++            if not before or not before.get('installed_version') or not before.get('latest_version'):
++                raise Invalid('Update metadata missing')
++            strip = lambda x: x.removeprefix('v')
++            if strip(before['installed_version']) == strip(before['latest_version']):
++                return result(r, 'NO_CHANGE', before, before, True)
++            if strip(before['latest_version']) != '0.1.70':
++                raise Invalid('Latest version is outside MVP approval')
++            if r['dry_run']:
++                return result(r, 'DRY_RUN', before, before)
++            await self.adapter.install_update(p.get('data', {}).get('version', before['latest_version']))
++            after = self.adapter.update_state()
++            verified = bool(after and strip(after.get('installed_version', '')) == '0.1.70')
++            out = result(r, 'SUCCESS' if verified else 'VERIFY_FAILED', before, after, verified)
++            out['restart_required'] = True
++            return out
++        if operation == 'ha_area_create':
++            existing = next((a for a in self.adapter.areas() if normalized(a['name']) == normalized(p['name'])), None)
++            if existing:
++                return result(r, 'ALREADY_EXISTS', existing, existing, True)
++            self._floor(p)
++            change = self._change(p)
++            if r['dry_run']:
++                return result(r, 'DRY_RUN', None, {'planned': change})
++            area_id = self.adapter.create(change)
++            after = self.adapter.area(area_id)
++            verified = self._matches(after, change)
++            return result(r, 'SUCCESS' if verified else 'VERIFY_FAILED', None, after, verified)
++        before = self.adapter.area(p['area_id'])
++        if before is None:
++            raise Invalid('Unknown Area')
++        if operation == 'ha_area_get_environment_entities':
++            after = {'temperature_entity': before['temperature_entity_id'],
++                     'humidity_entity': before['humidity_entity_id'],
++                     'candidates': self.adapter.candidates(p['area_id'])}
++            return result(r, 'SUCCESS', before, after, True)
++        if operation == 'ha_area_set_temperature_entity':
++            candidate = next((e for e in self.adapter.candidates(p['area_id']) if e['entity_id'] == p['entity_id']), None)
++            if not candidate or candidate['device_class'] != 'temperature' or candidate['diagnostic'] or candidate['unit'] not in ('°C', '°F', 'K'):
++                raise Invalid('Entity is not an eligible environmental temperature')
++            if 'device_temperature' in p['entity_id']:
++                raise Invalid('Device temperature cannot be preferred')
++            change = {'temperature_entity_id': p['entity_id']}
++        else:
++            self._floor(p)
++            change = self._change({k: v for k, v in p.items() if k != 'area_id'})
++            if 'name' in change and any(a['area_id'] != p['area_id'] and normalized(a['name']) == normalized(change['name']) for a in self.adapter.areas()):
++                raise Invalid('Duplicate Area name')
++        if self._matches(before, change):
++            return result(r, 'NO_CHANGE', before, before, True)
++        if r['dry_run']:
++            return result(r, 'DRY_RUN', before, {**before, **change})
++        self.adapter.update(p['area_id'], change)
++        after = self.adapter.area(p['area_id'])
++        expected = {**before, **change}
++        # Stable projection excludes timestamp changes, includes all untouched MVP metadata.
++        verified = after == expected
++        return result(r, 'SUCCESS' if verified else 'VERIFY_FAILED', before, after, verified)
++
++    def _floor(self, payload):
++        if payload.get('floor_id') is not None and not self.adapter.floor_exists(payload['floor_id']):
++            raise Invalid('Unknown Floor')
++
++    @staticmethod
++    def _change(payload):
++        change = dict(payload)
++        if 'name' in change:
++            change['name'] = change['name'].strip()
++        if 'aliases' in change:
++            change['aliases'] = sorted(set(a.strip() for a in (change['aliases'] or [])))
++        return change
++
++    @staticmethod
++    def _matches(area, change):
++        return area is not None and all(area.get(k) == v for k, v in change.items())
+diff --git a/custom_components/codex_cli/write_contract.py b/custom_components/codex_cli/write_contract.py
+new file mode 100644
+index 0000000..56297ed
+--- /dev/null
++++ b/custom_components/codex_cli/write_contract.py
+@@ -0,0 +1,144 @@
++"""Strict MVP wire contract; shared verbatim with the trusted worker."""
++import hashlib
++import hmac
++import json
++import re
++import unicodedata
++
++PROTOCOL = 1
++SCOPES = {
++    'ha_area_create': 'WRITE_REGISTRY',
++    'ha_area_update': 'WRITE_REGISTRY',
++    'ha_area_get_environment_entities': 'READ',
++    'ha_area_set_temperature_entity': 'WRITE_REGISTRY',
++    'ha_service_call': 'WRITE_SERVICE',
++}
++FIELDS = {
++    'ha_area_create': ({'name'}, {'name', 'floor_id', 'icon', 'aliases'}),
++    'ha_area_update': ({'area_id'}, {'area_id', 'name', 'floor_id', 'icon', 'aliases'}),
++    'ha_area_get_environment_entities': ({'area_id'}, {'area_id'}),
++    'ha_area_set_temperature_entity': ({'area_id', 'entity_id'}, {'area_id', 'entity_id'}),
++    'ha_service_call': ({'domain', 'service', 'target'}, {'domain', 'service', 'target', 'data'}),
++}
++
++class Invalid(ValueError):
++    """Input cannot be executed."""
++
++class Denied(ValueError):
++    """Authorization cannot be accepted."""
++
++def canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
++
++def normalized(name):
++    return ' '.join(unicodedata.normalize('NFKC', name).split()).casefold()
++
++def text(value):
++    if not isinstance(value, str) or not value.strip() or len(value) > 128 or any(ord(c) < 32 for c in value):
++        raise Invalid('Invalid bounded string')
++
++def identifier(value):
++    if not isinstance(value, str) or not re.fullmatch(r'[a-z0-9_]{1,128}', value):
++        raise Invalid('Invalid registry identifier')
++
++def validate(operation, payload, dry_run):
++    if operation not in SCOPES:
++        raise Denied('Unknown operation')
++    if not isinstance(payload, dict) or type(dry_run) is not bool:
++        raise Invalid('Invalid request shape')
++    required, allowed = FIELDS[operation]
++    if required - payload.keys() or payload.keys() - allowed:
++        raise Invalid('Missing or forbidden fields')
++    if 'name' in payload:
++        text(payload['name'])
++    for key in ('area_id', 'floor_id'):
++        if key in payload and not (key == 'floor_id' and payload[key] is None):
++            identifier(payload[key])
++    if 'icon' in payload and payload['icon'] is not None:
++        if not isinstance(payload['icon'], str) or not re.fullmatch(r'mdi:[a-z0-9-]{1,80}', payload['icon']):
++            raise Invalid('Invalid icon')
++    if 'aliases' in payload and payload['aliases'] is not None:
++        if not isinstance(payload['aliases'], list) or len(payload['aliases']) > 32:
++            raise Invalid('Invalid aliases')
++        for alias in payload['aliases']:
++            text(alias)
++    if 'entity_id' in payload:
++        if not isinstance(payload['entity_id'], str) or not re.fullmatch(r'sensor\.[a-z0-9_]{1,128}', payload['entity_id']):
++            raise Invalid('Invalid sensor entity')
++    if operation == 'ha_service_call':
++        if (payload['domain'], payload['service']) != ('update', 'install'):
++            raise Denied('Service is not allowlisted')
++        if payload['target'] != {'entity_id': 'update.codex_update'}:
++            raise Denied('Target is not allowlisted')
++        data = payload.get('data', {})
++        if not isinstance(data, dict) or set(data) - {'version'}:
++            raise Invalid('Forbidden service data')
++        # Pin MVP to the approved upstream build; cannot install a future/unreviewed version.
++        if data.get('version', '0.1.70') not in ('0.1.70', 'v0.1.70'):
++            raise Denied('Version is not allowlisted')
++
++def target_for(operation, payload):
++    if operation == 'ha_area_create':
++        return {'normalized_name': normalized(payload['name'])}
++    if operation == 'ha_service_call':
++        return {'entity_id': 'update.codex_update'}
++    return {'area_id': payload['area_id']}
++
++REQUEST_KEYS = {'protocol_version', 'operation_id', 'task_id', 'turn_id', 'operation', 'scope', 'target', 'payload', 'dry_run'}
++
++def digest(request):
++    return hashlib.sha256(canonical(request)).hexdigest()
++
++def signature(secret, claims):
++    key = hmac.new(secret.encode(), b'codex-cli/write-v1', hashlib.sha256).digest()
++    return hmac.new(key, canonical(claims), hashlib.sha256).hexdigest()
++
++def authorize(request, proof, secret, now, seen):
++    if set(request) != REQUEST_KEYS or request.get('protocol_version') != PROTOCOL:
++        raise Invalid('Unsupported protocol or request shape')
++    validate(request['operation'], request['payload'], request['dry_run'])
++    for key in ('task_id', 'turn_id', 'operation_id'):
++        text(request[key])
++    if request['scope'] != SCOPES[request['operation']] or request['target'] != target_for(request['operation'], request['payload']):
++        raise Denied('Scope or target mismatch')
++    expected = {'task_id', 'turn_id', 'operation_id', 'allowed_operation', 'allowed_target', 'scope', 'expiration', 'nonce', 'request_digest'}
++    if not isinstance(proof, dict) or set(proof) != {'claims', 'signature'}:
++        raise Denied('Missing authorization')
++    claims = proof['claims']
++    if not isinstance(claims, dict) or set(claims) != expected:
++        raise Denied('Invalid authorization shape')
++    try:
++        valid_signature = hmac.compare_digest(signature(secret, claims), proof['signature'])
++    except (TypeError, ValueError):
++        raise Denied('Invalid authorization') from None
++    if not valid_signature:
++        raise Denied('Invalid authorization')
++    expiration = claims['expiration']
++    if type(expiration) not in (int, float) or not now < expiration <= now + 60:
++        raise Denied('Expired or excessive authorization lifetime')
++    checks = {'task_id': request['task_id'], 'turn_id': request['turn_id'], 'operation_id': request['operation_id'],
++              'allowed_operation': request['operation'], 'allowed_target': request['target'],
++              'scope': request['scope'], 'request_digest': digest(request)}
++    if any(claims[k] != v for k, v in checks.items()):
++        raise Denied('Authorization binding mismatch')
++    nonce = claims['nonce']
++    if not isinstance(nonce, str) or not re.fullmatch(r'[a-f0-9]{32}', nonce):
++        raise Denied('Invalid nonce')
++    for n, exp in list(seen.items()):
++        if exp <= now:
++            del seen[n]
++    if nonce in seen or len(seen) >= 4096:
++        raise Denied('Replay or authorization capacity exceeded')
++    seen[nonce] = expiration
++
++def result(request, status, before=None, after=None, verified=False, warnings=None):
++    # Never echo unvalidated attacker-controlled fields, even on error paths.
++    try:
++        validate(request.get('operation'), request.get('payload'), request.get('dry_run'))
++        safe_target = target_for(request['operation'], request['payload'])
++        safe_requested = request['payload']
++    except (Invalid, Denied, TypeError, KeyError):
++        safe_target, safe_requested = None, None
++    return {'status': status, 'operation_id': request.get('operation_id'), 'tool': request.get('operation'),
++            'target': safe_target, 'before': before, 'requested': safe_requested,
++            'after': after, 'verified': verified, 'restart_required': False, 'warnings': warnings or []}
+diff --git a/tests/test_endpoint.py b/tests/test_endpoint.py
+new file mode 100644
+index 0000000..bd1c673
+--- /dev/null
++++ b/tests/test_endpoint.py
+@@ -0,0 +1,97 @@
++"""HA endpoint wiring tests with module stubs, never a production HA process."""
++import importlib
++import json
++import sys
++import types
++import unittest
++from test_write_v1 import ROOT, SECRET, envelope, Backend, FakeAdapter, MemoryAudit, NOW
++
++class HttpError(Exception): pass
++class View:
++    def json(self, data, **kwargs): return data
++
++def module(name, **attrs):
++    m=types.ModuleType(name);m.__path__=[]
++    for key,value in attrs.items():setattr(m,key,value)
++    sys.modules[name]=m
++    return m
++
++module('aiohttp',web=types.SimpleNamespace(HTTPServiceUnavailable=HttpError,HTTPForbidden=HttpError,
++                                         HTTPBadRequest=HttpError,HTTPRequestEntityTooLarge=lambda **kw:HttpError()))
++module('homeassistant')
++module('homeassistant.components')
++module('homeassistant.components.http',HomeAssistantView=View)
++module('homeassistant.components.http.const',KEY_HASS_USER='ha_user')
++module('homeassistant.const',__version__='2026.9.4')
++helpers=module('homeassistant.helpers')
++for name in ('area_registry','floor_registry','entity_registry','device_registry'):
++    setattr(helpers,name,module('homeassistant.helpers.'+name))
++module('isolated_codex.const',DOMAIN='codex_cli')
++api=importlib.import_module('isolated_codex.write_api')
++
++class Content:
++    def __init__(self,data):self.data=data
++    async def iter_chunked(self,n):
++        for i in range(0,len(self.data),n):yield self.data[i:i+n]
++
++class Request(dict):
++    def __init__(self,body,admin=True):
++        super().__init__({'ha_user':types.SimpleNamespace(is_admin=admin)})
++        self.content=Content(json.dumps(body).encode())
++
++class EndpointTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.adapter=FakeAdapter();self.backend=Backend(self.adapter,SECRET,MemoryAudit(),lambda:NOW)
++        self.hass=types.SimpleNamespace(data={'codex_cli':{'write_backend':self.backend}})
++        self.view=api.WriteOperationView(self.hass)
++        r,proof=envelope('ha_area_create',{'name':'WC dole'},True)
++        self.body={**r,'authorization':proof,'worker_token':SECRET}
++    async def test_paired_admin_dry_run(self):
++        out=await self.view.post(Request(self.body))
++        self.assertEqual(out['status'],'DRY_RUN');self.assertFalse(self.adapter.calls)
++        self.assertNotIn(SECRET,json.dumps(out))
++    async def test_non_admin_denied(self):
++        with self.assertRaises(HttpError):await self.view.post(Request(self.body,False))
++        self.assertFalse(self.adapter.calls)
++    async def test_pairing_secret_denied(self):
++        self.body['worker_token']='wrong'
++        with self.assertRaises(HttpError):await self.view.post(Request(self.body))
++    async def test_no_backend_denied(self):
++        self.hass.data={}
++        with self.assertRaises(HttpError):await self.view.post(Request(self.body))
++    async def test_arbitrary_url_denied(self):
++        self.body['url']='http://untrusted.invalid'
++        with self.assertRaises(HttpError):await self.view.post(Request(self.body))
++    async def test_large_body_denied(self):
++        self.body['extra']='x'*20000
++        with self.assertRaises(HttpError):await self.view.post(Request(self.body))
++    async def test_bad_proof_denied(self):
++        self.body['authorization']['signature']='0'*64
++        self.assertEqual((await self.view.post(Request(self.body)))['status'],'PERMISSION_DENIED')
++
++class AdapterTests(unittest.IsolatedAsyncioTestCase):
++    async def test_service_signature(self):
++        calls=[]
++        async def async_call(*args,**kwargs):calls.append((args,kwargs))
++        adapter=object.__new__(api.HAAdapter)
++        adapter.hass=types.SimpleNamespace(services=types.SimpleNamespace(async_call=async_call))
++        await adapter.install_update('v0.1.70')
++        self.assertEqual(calls,[(('update','install',{'version':'v0.1.70'}),{'blocking':True,'target':{'entity_id':'update.codex_update'}})])
++    async def test_unsupported_core_version(self):
++        previous=api.HA_VERSION
++        try:
++            api.HA_VERSION='2026.9.5'
++            with self.assertRaises(ValueError):api.HAAdapter(types.SimpleNamespace())
++        finally:api.HA_VERSION=previous
++
++class MCPTests(unittest.TestCase):
++    def test_tool_discovery(self):
++        m=importlib.import_module('verification_mcp')
++        tools=m.respond({'method':'tools/list'})['tools']
++        self.assertEqual({t['name'] for t in tools},{'verify','ha_area_create','ha_area_update','ha_area_get_environment_entities','ha_area_set_temperature_entity','ha_service_call'})
++        for tool in tools:
++            self.assertFalse(tool['inputSchema']['additionalProperties'])
++            self.assertNotIn('scope',tool['inputSchema']['properties'])
++    def test_read_tools_preserved(self):
++        m=importlib.import_module('verification_mcp')
++        self.assertEqual(m.TOOL['inputSchema']['properties']['operation']['enum'],['entity','config_check','logs','dashboard','dashboard_readback'])
+diff --git a/tests/test_write_v1.py b/tests/test_write_v1.py
+new file mode 100644
+index 0000000..a3404e1
+--- /dev/null
++++ b/tests/test_write_v1.py
+@@ -0,0 +1,243 @@
++"""No HA imports, sockets, service calls or production file writes."""
++import asyncio
++import copy
++import importlib
++import json
++from pathlib import Path
++import secrets
++import sys
++import tempfile
++import threading
++import types
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++pkg = types.ModuleType('isolated_codex')
++pkg.__path__ = [str(ROOT / 'custom_components/codex_cli')]
++sys.modules['isolated_codex'] = pkg
++C = importlib.import_module('isolated_codex.write_contract')
++Backend = importlib.import_module('isolated_codex.write_backend').Backend
++Audit = importlib.import_module('isolated_codex.write_audit').Audit
++ReplayGuard = importlib.import_module('isolated_codex.write_auth').ReplayGuard
++sys.path.insert(0, str(ROOT / 'codex-cli-worker'))
++from write_broker import WriteBroker
++
++SECRET = 'isolated-test-secret-do-not-use-in-production'
++NOW = 1000
++
++def envelope(operation, payload, dry=False):
++    r = {'protocol_version': 1, 'operation_id': secrets.token_hex(16), 'task_id': 'test-task',
++         'turn_id': 'test-turn', 'operation': operation, 'scope': C.SCOPES.get(operation, 'READ'),
++         'target': C.target_for(operation, payload) if operation in C.SCOPES else {},
++         'payload': payload, 'dry_run': dry}
++    claims = {'task_id': r['task_id'], 'turn_id': r['turn_id'], 'operation_id': r['operation_id'],
++              'allowed_operation': operation, 'allowed_target': r['target'], 'scope': r['scope'],
++              'expiration': NOW+30, 'nonce': secrets.token_hex(16), 'request_digest': C.digest(r)}
++    return r, {'claims': claims, 'signature': C.signature(SECRET, claims)}
++
++class MemoryAudit:
++    def __init__(self): self.rows = []
++    def emit(self, *args): self.rows.append(args)
++
++class FakeAdapter:
++    def __init__(self):
++        self.items = {'kitchen': {'area_id': 'kitchen', 'name': 'Kuchyňa', 'floor_id': None,
++                                  'icon': None, 'aliases': [], 'temperature_entity_id': 'sensor.old',
++                                  'humidity_entity_id': 'sensor.humidity', 'picture': None, 'labels': []}}
++        self.entities = [{'entity_id': 'sensor.room_temperature', 'device_class': 'temperature',
++                          'unit': '°C', 'diagnostic': False}]
++        self.installed = 'v0.1.70'; self.latest = 'v0.1.70'
++        self.calls = []; self.bad_readback = False
++    def areas(self): return copy.deepcopy(list(self.items.values()))
++    def area(self, key): return copy.deepcopy(self.items.get(key))
++    def floor_exists(self, key): return key in ('prizemie', 'poschodie')
++    def create(self, change):
++        key = 'created'
++        self.items[key] = {'area_id': key, 'floor_id': None, 'icon': None, 'aliases': [],
++                           'temperature_entity_id': None, 'humidity_entity_id': None,
++                           'picture': None, 'labels': [], **change}
++        self.calls.append(('create', change))
++        return key
++    def update(self, key, change):
++        self.calls.append(('update', key, change))
++        if not self.bad_readback: self.items[key].update(change)
++    def candidates(self, area_id): return copy.deepcopy(self.entities) if area_id == 'kitchen' else []
++    def update_state(self): return {'installed_version': self.installed, 'latest_version': self.latest}
++    async def install_update(self, version): self.calls.append(('install', version)); self.installed = version
++
++class Operations(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.adapter = FakeAdapter(); self.audit = MemoryAudit()
++        self.backend = Backend(self.adapter, SECRET, self.audit, lambda: NOW)
++    async def call(self, op, payload, dry=False):
++        r, p = envelope(op, payload, dry); return await self.backend.execute(r, p)
++    async def test_create(self):
++        x = await self.call('ha_area_create', {'name': 'WC dole', 'floor_id': 'prizemie'})
++        self.assertEqual(x['status'], 'SUCCESS'); self.assertTrue(x['verified'])
++        self.assertEqual([r[0] for r in self.audit.rows], ['START', 'RESULT'])
++    async def test_normalized_duplicate(self):
++        x = await self.call('ha_area_create', {'name': '  KUCHYŇA  '})
++        self.assertEqual(x['status'], 'ALREADY_EXISTS'); self.assertFalse(self.adapter.calls)
++    async def test_update_name(self):
++        self.assertEqual((await self.call('ha_area_update', {'area_id':'kitchen','name':'Kitchen'}))['status'],'SUCCESS')
++    async def test_set_floor(self):
++        x = await self.call('ha_area_update', {'area_id':'kitchen','floor_id':'prizemie'})
++        self.assertEqual(x['after']['floor_id'],'prizemie'); self.assertEqual(x['after']['humidity_entity_id'],'sensor.humidity')
++    async def test_remove_floor(self):
++        self.adapter.items['kitchen']['floor_id']='prizemie'
++        x = await self.call('ha_area_update', {'area_id':'kitchen','floor_id':None})
++        self.assertIsNone(x['after']['floor_id'])
++    async def test_omitted_floor_unchanged(self):
++        self.adapter.items['kitchen']['floor_id']='prizemie'
++        x = await self.call('ha_area_update', {'area_id':'kitchen','icon':'mdi:home'})
++        self.assertEqual(x['after']['floor_id'],'prizemie')
++    async def test_unknown_area(self):
++        self.assertEqual((await self.call('ha_area_update', {'area_id':'missing'}))['status'],'VALIDATION_ERROR')
++    async def test_unknown_floor(self):
++        self.assertEqual((await self.call('ha_area_create', {'name':'New','floor_id':'missing'}))['status'],'VALIDATION_ERROR')
++    async def test_create_dry_run(self):
++        self.assertEqual((await self.call('ha_area_create', {'name':'New'}, True))['status'],'DRY_RUN');self.assertFalse(self.adapter.calls)
++    async def test_update_dry_run(self):
++        self.assertEqual((await self.call('ha_area_update', {'area_id':'kitchen','floor_id':'prizemie'}, True))['status'],'DRY_RUN');self.assertFalse(self.adapter.calls)
++    async def test_idempotency(self):
++        p={'area_id':'kitchen','floor_id':'prizemie'}
++        await self.call('ha_area_update',p)
++        self.assertEqual((await self.call('ha_area_update',p))['status'],'NO_CHANGE');self.assertEqual(len(self.adapter.calls),1)
++    async def test_verification_failure(self):
++        self.adapter.bad_readback=True
++        self.assertEqual((await self.call('ha_area_update',{'area_id':'kitchen','floor_id':'prizemie'}))['status'],'VERIFY_FAILED')
++    async def test_valid_temperature(self):
++        x=await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'})
++        self.assertEqual(x['status'],'SUCCESS');self.assertEqual(x['before']['temperature_entity_id'],'sensor.old')
++    async def test_device_temperature(self):
++        self.adapter.entities[0]['entity_id']='sensor.room_device_temperature'
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_device_temperature'}))['status'],'VALIDATION_ERROR')
++    async def test_diagnostic_temperature(self):
++        self.adapter.entities[0]['diagnostic']=True
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'}))['status'],'VALIDATION_ERROR')
++    async def test_non_temperature(self):
++        self.adapter.entities[0]['device_class']='humidity'
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'}))['status'],'VALIDATION_ERROR')
++    async def test_wrong_area(self):
++        self.adapter.entities=[]
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'}))['status'],'VALIDATION_ERROR')
++    async def test_missing_entity(self):
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.missing'}))['status'],'VALIDATION_ERROR')
++    async def test_wrong_unit(self):
++        self.adapter.entities[0]['unit']='hPa'
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'}))['status'],'VALIDATION_ERROR')
++    async def test_temperature_dry_run(self):
++        self.assertEqual((await self.call('ha_area_set_temperature_entity',{'area_id':'kitchen','entity_id':'sensor.room_temperature'},True))['status'],'DRY_RUN');self.assertFalse(self.adapter.calls)
++    async def test_environment_read(self):
++        self.assertTrue((await self.call('ha_area_get_environment_entities',{'area_id':'kitchen'}))['verified']);self.assertFalse(self.adapter.calls)
++    def service(self): return {'domain':'update','service':'install','target':{'entity_id':'update.codex_update'}}
++    async def test_update_already_current(self):
++        self.assertEqual((await self.call('ha_service_call',self.service()))['status'],'NO_CHANGE');self.assertFalse(self.adapter.calls)
++    async def test_update_install(self):
++        self.adapter.installed='v0.1.69'
++        self.assertEqual((await self.call('ha_service_call',self.service()))['status'],'SUCCESS');self.assertEqual(len(self.adapter.calls),1)
++    async def test_update_dry_run(self):
++        self.adapter.installed='v0.1.69'
++        self.assertEqual((await self.call('ha_service_call',self.service(),True))['status'],'DRY_RUN');self.assertFalse(self.adapter.calls)
++    async def test_unsupported_update_target(self):
++        p=self.service();p['target']['entity_id']='update.firmware'
++        self.assertEqual((await self.call('ha_service_call',p))['status'],'PERMISSION_DENIED')
++    async def test_unsupported_service(self):
++        p=self.service();p['domain']='mqtt';p['service']='publish'
++        self.assertEqual((await self.call('ha_service_call',p))['status'],'PERMISSION_DENIED')
++    async def test_future_version_denied(self):
++        p=self.service();p['data']={'version':'0.1.71'}
++        self.assertEqual((await self.call('ha_service_call',p))['status'],'PERMISSION_DENIED')
++    async def test_secret_not_echoed(self):
++        p=self.service();p['data']={'token':'SENSITIVE_SENTINEL'}
++        out=await self.call('ha_service_call',p)
++        self.assertNotIn('SENSITIVE_SENTINEL',json.dumps(out))
++
++class Security(unittest.TestCase):
++    def setUp(self): self.r,self.proof=envelope('ha_area_update',{'area_id':'kitchen','floor_id':'prizemie'});self.seen={}
++    def check(self): C.authorize(self.r,self.proof,SECRET,NOW,self.seen)
++    def resign(self): self.proof['signature']=C.signature(SECRET,self.proof['claims'])
++    def test_expired(self):
++        self.proof['claims']['expiration']=NOW;self.resign()
++        with self.assertRaises(C.Denied):self.check()
++    def test_bad_digest(self):
++        self.r['payload']['floor_id']=None
++        with self.assertRaises(C.Denied):self.check()
++    def test_replay(self):
++        self.check()
++        with self.assertRaises(C.Denied):self.check()
++    def test_wrong_task(self):
++        self.r['task_id']='other'
++        with self.assertRaises(C.Denied):self.check()
++    def test_wrong_turn(self):
++        self.r['turn_id']='other'
++        with self.assertRaises(C.Denied):self.check()
++    def test_scope_escalation(self):
++        self.r['scope']='SYSTEM_RESTART'
++        with self.assertRaises(C.Denied):self.check()
++    def test_bad_signature(self):
++        self.proof['signature']='f'*64
++        with self.assertRaises(C.Denied):self.check()
++    def test_unknown_operation(self):
++        self.r['operation']='ha_core_restart'
++        with self.assertRaises(C.Denied):self.check()
++    def test_ws_injection(self):
++        self.r['payload']['websocket_command']='config/area_registry/delete'
++        with self.assertRaises(C.Invalid):self.check()
++    def test_url_path_injection(self):
++        for field in ('url','path','method','python'):
++            with self.subTest(field=field):
++                p={'area_id':'kitchen',field:'../../.storage/auth'}
++                with self.assertRaises(C.Invalid):C.validate('ha_area_update',p,False)
++    def test_read_scope(self):
++        self.r['scope']='READ'
++        with self.assertRaises(C.Denied):self.check()
++    def test_replay_survives_new_backend(self):
++        with tempfile.TemporaryDirectory() as d:
++            self.seen=ReplayGuard(d,lambda:NOW);self.check()
++            self.seen=ReplayGuard(d,lambda:NOW)
++            with self.assertRaises(C.Denied):self.check()
++    def test_audit_bounded_and_private(self):
++        with tempfile.TemporaryDirectory() as d:
++            a=Audit(d);a.handler.maxBytes=250
++            for _ in range(40):a.emit('START',self.r)
++            a.close();files=list(Path(d).glob('write-v1*'))
++            self.assertLessEqual(len(files),5)
++            self.assertNotIn(SECRET,''.join(p.read_text() for p in files))
++            self.assertEqual(Path(d,'write-v1.jsonl').stat().st_mode&0o777,0o600)
++
++class WorkerTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
++        self.worker=types.SimpleNamespace(lock=threading.RLock(),tasks={'test-task':{'current_turn_id':'test-turn','status':'running'}},
++                                         task_cancellation_requested=lambda t:False,api_token=lambda:SECRET,DATA_ROOT=Path(self.tmp.name))
++        self.sent=[]
++        def core(method,path,**kwargs):
++            self.sent.append((method,path,kwargs));r=kwargs['json'];return C.result(r,'DRY_RUN')
++        self.broker=WriteBroker(self.worker,core,lambda:NOW)
++    def test_read_only_grant_denied(self):
++        self.broker.begin('test-task','test-turn',['READ'])
++        self.assertEqual(self.broker.execute('test-task','ha_area_create',{'name':'New'})['status'],'PERMISSION_DENIED');self.assertFalse(self.sent)
++    def test_missing_scope(self):
++        self.assertEqual(self.broker.execute('test-task','ha_service_call',{'domain':'update','service':'install','target':{'entity_id':'update.codex_update'}})['status'],'PERMISSION_DENIED')
++    def test_signed_fixed_endpoint(self):
++        self.broker.begin('test-task','test-turn',['WRITE_REGISTRY'])
++        self.broker.execute('test-task','ha_area_create',{'name':'New'},True)
++        method,path,k=self.sent[0];self.assertEqual(path,'codex_cli/write_operation')
++        r=k['json'].copy();proof=r.pop('authorization');C.authorize(r,proof,SECRET,NOW,{})
++    def test_scope_in_argument_rejected(self):
++        self.broker.begin('test-task','test-turn',['WRITE_REGISTRY'])
++        self.assertEqual(self.broker.execute('test-task','ha_area_create',{'name':'New','scope':'SYSTEM_RESTART'})['status'],'VALIDATION_ERROR')
++    def test_turn_replaced_denied(self):
++        self.broker.begin('test-task','old-turn',['WRITE_REGISTRY'])
++        self.assertEqual(self.broker.execute('test-task','ha_area_create',{'name':'New'})['status'],'PERMISSION_DENIED')
++    def test_end_revokes(self):
++        self.broker.begin('test-task','test-turn',['WRITE_REGISTRY']);self.broker.end('test-task')
++        self.assertEqual(self.broker.execute('test-task','ha_area_create',{'name':'New'})['status'],'PERMISSION_DENIED')
++    def test_denial_audited(self):
++        self.broker.execute('test-task','ha_area_create',{'name':'New'})
++        rows=[json.loads(x) for x in Path(self.tmp.name,'write_audit/write-v1.jsonl').read_text().splitlines()]
++        self.assertEqual([x['stage'] for x in rows],['START','RESULT'])
++        self.assertEqual(rows[-1]['result'],'PERMISSION_DENIED')
++
++if __name__=='__main__':unittest.main()

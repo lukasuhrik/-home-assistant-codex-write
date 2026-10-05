@@ -1,0 +1,60 @@
+name: Codex CLI Worker Trusted HA Bridge
+description: Codex CLI worker with a finite trusted Home Assistant registry bridge.
+version: "0.1.70-haipc1"
+slug: codex_cli_worker
+url: https://github.com/lukasuhrik/-home-assistant-codex-write
+image: ghcr.io/lukasuhrik/codex-cli-worker-trusted
+init: false
+startup: services
+boot: manual
+stdin: true
+ingress: true
+ingress_port: 9123
+panel_icon: mdi:robot
+apparmor: true
+arch:
+  - aarch64
+  - amd64
+map:
+  - type: homeassistant_config
+    read_only: false
+    path: /config
+homeassistant_api: true
+hassio_api: true
+hassio_role: default
+backup_exclude:
+  - "*/ha-docs*"
+discovery:
+  - codex_cli
+options:
+  codex_model: default
+  model_reasoning_effort: medium
+  reasoning_summary: concise
+  codex_sandbox: workspace-write
+  task_root: /config/codex_tasks
+  task_timeout_seconds: 3600
+  auto_save_lovelace: true
+  config_check: true
+  full_snapshot: false
+  backup_retention_days: 7
+  browser_verification: true
+  browser_memory_limit_mib: 1536
+  local_docs: true
+  ha_url: http://homeassistant:8123
+schema:
+  codex_model: list(default|gpt-6-astra|gpt-6.1-sol|gpt-6-sol|gpt-6-luna|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5)
+  model_reasoning_effort: list(minimal|low|medium|high|xhigh)
+  reasoning_summary: list(concise|detailed|none)
+  codex_sandbox: list(workspace-write|danger-full-access|read-only)
+  task_root: str
+  notify_service: str?
+  task_timeout_seconds: int
+  auto_save_lovelace: bool
+  config_check: bool
+  full_snapshot: bool
+  backup_retention_days: int(1,365)
+  browser_verification: bool
+  browser_memory_limit_mib: int(512,8192)
+  local_docs: bool
+  ha_url: str
+  HA_TOKEN: password?

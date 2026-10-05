@@ -1,0 +1,677 @@
+diff --git a/TRUSTED_HA_BRIDGE.md b/TRUSTED_HA_BRIDGE.md
+new file mode 100644
+index 0000000..fa42a31
+--- /dev/null
++++ b/TRUSTED_HA_BRIDGE.md
+@@ -0,0 +1,23 @@
++# Trusted HA bridge candidate — NOT DEPLOYED
++
++Version: 0.1.70-haipc1. Base: upstream v0.1.70, commit 06ee7b0b77455119a0ffcbc79217e6ccda8a7128.
++
++Reuse the existing private /data/verification.sock and active task capability. The helper never reads HA credentials or uses HTTP. The trusted parent performs only five fixed operations and eleven codex_cli services. Browser identity stays read-only. No new MCP broker or transport server is introduced. Supervisor credentials remain in the parent environment. The existing subprocess environment no longer injects optional HA_TOKEN/HA_URL.
++
++Request bound: 16384 bytes. Reply bound: 2 MiB. API timeout: 15 seconds; helper timeout: 40 seconds. No redirects, proxies, arbitrary URLs, shell execution or retries. Mutation IDs are serialized and deduplicated in a bounded process-local ledger. An unknown outcome must be read back manually before any fresh mutation. IDs do not survive a worker restart; the helper does not retry across restarts. Core restart is explicitly disabled by parent policy; the restart-core command returns PERMISSION_DENIED without any Supervisor call. Audit emits START/RESULT summaries to existing container stderr, not a new unbounded file.
++
++## Core restart disabled by user decision
++Supervisor 2026.09.3 supervisor/api/middleware/security.py allows default role only paths ending /info; POST /core/restart is denied. homeassistant role allows /core/* but exceeds the requested default role. The candidate keeps default and does NOT broaden it. The explicit restart command is retained for a clear denial, but the backend performs no restart HTTP request. This is a deliberate policy, not a deployment blocker. No role upgrade is requested. Source: https://github.com/home-assistant/supervisor/blob/2026.09.3/supervisor/api/middleware/security.py
++
++## External build and validation
++No builder or supported add-on deployment/restart API is available in the current execution context. No image, digest, deployment or worker restart has been produced.
++
++1. On an external isolated runner, run: HA_BRIDGE_REAL_IPC_TEST=1 python -B -m unittest discover -s bridge-tests. Run worker server regression tests and remaining upstream suite with its dependencies.
++2. Resolve an appropriate amd64 Home Assistant Alpine base image to its sha256 digest. Build from codex-cli-worker with BUILD_FROM pinned to that digest, BUILD_VERSION=0.1.70-haipc1, BUILD_ARCH=amd64 and CODEX_VERSION=0.160.0. Record resulting image digest. Do not claim a reproducible digest before a successful build. Example command, substitute actual pinned base reference:
++   docker build --build-arg BUILD_FROM=<base-image@sha256:digest> --build-arg BUILD_VERSION=0.1.70-haipc1 --build-arg BUILD_ARCH=amd64 --build-arg CODEX_VERSION=0.160.0 -t <private-image>:0.1.70-haipc1 codex-cli-worker
++3. Exercise image startup, Python imports, CLI startup, real IPC, authentication denial, task cancellation, read verification, config_check and dashboard pipeline in isolation. Never inject a real Supervisor token into test child processes. Confirm effective add-on permissions through supported Supervisor metadata.
++4. Before installation, checkpoint the actual installed worker image/digest, add-on config, options, data/pairing, and recovery path using supported HA backup mechanisms. They are not accessible here; the upstream declaration is not a backup of the installed add-on.
++5. Install only through a supported custom add-on/image workflow preserving pairing/data. Restart ONLY the worker as authorized. Do not install or edit codex_cli backend and do not restart Core. Read-only smoke tests: ha-codex-ha ping, config, services. Verify child credentials absent. Missing eleven registry services is recorded, not repaired by an automatic Core restart.
++6. Rollback: restore the original 0.1.70 worker image, config/options and pairing checkpoint through the same supported workflow; restart only worker. The local helper backup is in this task turn backups/bin/ha-codex-ha. Never edit Supervisor or HA .storage by hand.
++
++No service writes or Core restart are part of these smoke tests. Core restart remains disabled. Any future enablement requires a new explicit decision and security review.
+diff --git a/bridge-test-results.txt b/bridge-test-results.txt
+new file mode 100644
+index 0000000..b76aa86
+--- /dev/null
++++ b/bridge-test-results.txt
+@@ -0,0 +1,6 @@
++Bridge unit tests: 51 total; 49 PASS; 2 SKIPPED (real Unix socket bind forbidden by sandbox).
++Worker server regression tests: 42 PASS (previous run, unchanged server code).
++Syntax compilation: PASS.
++Core restart: policy denial verified with no API request.
++Real IPC, container build/startup and live bridge verification: NOT RUN.
++No live registry calls, worker restart or Core restart performed.
+diff --git a/bridge-tests/test_bridge.py b/bridge-tests/test_bridge.py
+new file mode 100644
+index 0000000..6a72224
+--- /dev/null
++++ b/bridge-tests/test_bridge.py
+@@ -0,0 +1,222 @@
++"""Trusted-parent/IPC tests; no HA network or production service calls."""
++import contextlib
++import importlib.machinery
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++import secrets
++import socket
++import sys
++import tempfile
++import threading
++import types
++import unittest
++from unittest.mock import patch
++
++ROOT = Path(__file__).resolve().parents[1] / 'codex-cli-worker'
++sys.path.insert(0,str(ROOT))
++import trusted_ha_bridge as bridge
++import verification
++loader=importlib.machinery.SourceFileLoader('ipc_helper',str(ROOT/'ha-codex-ha'))
++spec=importlib.util.spec_from_loader(loader.name,loader)
++helper=importlib.util.module_from_spec(spec);loader.exec_module(helper)
++
++
++class Worker:
++    def __init__(self):
++        self.lock=threading.RLock()
++        self.tasks={'task':{'status':'running','current_turn_id':'turn'}}
++        self.cancel=False
++    def task_cancellation_requested(self,task):return self.cancel
++
++
++class Client:
++    def __init__(self):self.calls=[];self.response={};self.fail=False;self.token=True
++    def available(self):return self.token
++    def request(self,*args):
++        self.calls.append(args)
++        if self.fail:raise bridge.Unavailable('not emitted')
++        return self.response
++
++
++class BridgeTests(unittest.TestCase):
++    def setUp(self):
++        self.worker=Worker();self.engine=verification.Verification(self.worker)
++        self.cap='isolated-capability-fixture';self.engine.capabilities['task']=self.cap
++        self.client=Client();self.engine.ha_bridge=bridge.Bridge(self.engine,self.client)
++        self.logs=io.StringIO()
++        self.log_patch=patch.object(bridge.LOG,'handlers',[__import__('logging').StreamHandler(self.logs)])
++        self.log_patch.start();self.addCleanup(self.log_patch.stop)
++    def request(self,op='ha.ping',**kwargs):return {'operation':op,'request_id':secrets.token_hex(16),**kwargs}
++    def dispatch(self,r):return self.engine.dispatch({**r,'capability':self.cap})
++    def call(self,domain='codex_cli',service='area_get',data=None):
++        return self.request('ha.call_service',domain=domain,service=service,data={'area_id':'kitchen'} if data is None else data)
++    def test_ping(self):
++        self.assertEqual(self.dispatch(self.request())['status'],'SUCCESS');self.assertEqual(self.client.calls,[('GET','/core/api/')])
++    def test_config_projection(self):
++        self.client.response={'version':'2026.9.4','secret':'not forwarded'}
++        self.assertEqual(self.dispatch(self.request('ha.config'))['result'],{'version':'2026.9.4'})
++    def test_services(self):
++        self.client.response=[{'domain':'codex_cli','services':{k:{} for k in bridge.SERVICES}}]
++        self.assertTrue(self.dispatch(self.request('ha.services'))['all_11_visible'])
++    def test_missing_services(self):
++        self.client.response=[];self.assertEqual(len(self.dispatch(self.request('ha.services'))['missing_registry_services']),11)
++    def test_allowed_service(self):
++        self.client.response={'service_response':{'status':'NO_CHANGE','verified':True}}
++        self.assertEqual(self.dispatch(self.call())['status'],'NO_CHANGE')
++        self.assertEqual(self.client.calls[0],('POST','/core/api/services/codex_cli/area_get?return_response',{'area_id':'kitchen'}))
++    def test_wrong_domain(self):
++        self.assertEqual(self.dispatch(self.call(domain='homeassistant'))['status'],'VALIDATION_ERROR');self.assertFalse(self.client.calls)
++    def test_unknown_service(self):self.assertEqual(self.dispatch(self.call(service='delete'))['status'],'VALIDATION_ERROR')
++    def test_arbitrary_url(self):self.assertEqual(self.dispatch(self.request(url='http://untrusted'))['status'],'VALIDATION_ERROR')
++    def test_method_injection(self):self.assertEqual(self.dispatch(self.request(method='POST'))['status'],'VALIDATION_ERROR')
++    def test_arbitrary_path(self):self.assertEqual(self.dispatch(self.request(path='/core/restart'))['status'],'VALIDATION_ERROR')
++    def test_unknown_operation(self):self.assertEqual(self.dispatch(self.request('ha.shell'))['status'],'VALIDATION_ERROR')
++    def test_forbidden_entity_field(self):self.assertEqual(self.dispatch(self.call(service='entity_registry_update',data={'entity_id':'sensor.x','platform':'bad'}))['status'],'VALIDATION_ERROR')
++    def test_forbidden_device_field(self):self.assertEqual(self.dispatch(self.call(service='device_registry_update',data={'device_id':'x','identifiers':[]}))['status'],'VALIDATION_ERROR')
++    def test_targets_missing(self):self.assertEqual(self.dispatch(self.call(data={}))['status'],'VALIDATION_ERROR')
++    def test_targets_ambiguous(self):self.assertEqual(self.dispatch(self.call(data={'area_id':'x','area_name':'x'}))['status'],'VALIDATION_ERROR')
++    def test_bad_id(self):self.assertEqual(self.dispatch({'operation':'ha.ping','request_id':'bad'})['status'],'VALIDATION_ERROR')
++    def test_restart_explicit(self):
++        self.client.response={'result':'ok'};self.assertEqual(self.dispatch(self.request('ha.restart_core'))['status'],'PERMISSION_DENIED')
++        self.assertFalse(self.client.calls)
++        self.assertIn('START operation=ha.restart_core',self.logs.getvalue());self.assertIn('RESULT operation=ha.restart_core',self.logs.getvalue())
++    def test_restart_denied_without_parent_token(self):
++        self.client.token=False;self.assertEqual(self.dispatch(self.request('ha.restart_core'))['status'],'PERMISSION_DENIED');self.assertFalse(self.client.calls)
++    def test_restart_perform_defense(self):
++        self.assertEqual(self.engine.ha_bridge.perform(self.request('ha.restart_core'))['status'],'PERMISSION_DENIED');self.assertFalse(self.client.calls)
++    def test_restart_params_denied(self):self.assertEqual(self.dispatch(self.request('ha.restart_core',data={}))['status'],'VALIDATION_ERROR')
++    def test_restart_generic_denied(self):self.assertEqual(self.dispatch(self.call(domain='homeassistant',service='restart',data={}))['status'],'VALIDATION_ERROR')
++    def test_restart_double_call_denied(self):
++        r=self.request('ha.restart_core');self.assertEqual(self.dispatch(r)['status'],'PERMISSION_DENIED');self.assertEqual(self.dispatch(r)['status'],'PERMISSION_DENIED');self.assertFalse(self.client.calls)
++    def test_unknown_no_retry(self):
++        self.client.fail=True;r=self.call();self.assertEqual(self.dispatch(r)['status'],'UNKNOWN')
++        self.assertEqual(self.dispatch(r)['status'],'UNKNOWN');self.assertEqual(len(self.client.calls),1)
++    def test_reused_id_different_request(self):
++        self.client.response={'service_response':{'status':'SUCCESS'}};r=self.call();self.dispatch(r)
++        self.assertEqual(self.dispatch({**self.call(service='area_create',data={'name':'Changed request'}),'request_id':r['request_id']})['status'],'PERMISSION_DENIED')
++    def test_no_parent_token(self):self.client.token=False;self.assertEqual(self.dispatch(self.request())['status'],'UNAVAILABLE');self.assertFalse(self.client.calls)
++    def test_expired_capability(self):
++        self.engine.capabilities.clear()
++        with self.assertRaises(ValueError):self.dispatch(self.request())
++    def test_cancelled(self):
++        self.worker.cancel=True
++        with self.assertRaises(ValueError):self.dispatch(self.request())
++    def test_wrong_capability(self):
++        with self.assertRaises(ValueError):self.engine.dispatch({**self.request(),'capability':'wrong'})
++    def test_read_verification_dispatch_preserved(self):
++        with patch.object(self.engine,'run',return_value={'status':'legacy'}) as run:
++            self.assertEqual(self.engine.dispatch({'operation':'entity','entity_id':'sensor.x','capability':self.cap}),{'status':'legacy'})
++            run.assert_called_once()
++    def test_no_auth_header_in_logs(self):
++        self.dispatch(self.request());self.assertNotIn('Authorization',self.logs.getvalue());self.assertNotIn(self.cap,self.logs.getvalue())
++    def test_mutation_ledger_bounded(self):
++        self.engine.ha_bridge.mutations={str(i):None for i in range(1024)}
++        self.assertEqual(self.dispatch(self.call())['status'],'UNAVAILABLE');self.assertFalse(self.client.calls)
++    def test_concurrent_service_once(self):
++        self.client.response={'service_response':{'status':'SUCCESS'}};r=self.call();threads=[threading.Thread(target=self.dispatch,args=(r,)) for _ in range(10)]
++        for t in threads:t.start()
++        for t in threads:t.join()
++        self.assertEqual(len(self.client.calls),1)
++    @unittest.skipUnless(os.environ.get('HA_BRIDGE_REAL_IPC_TEST')=='1', 'Requires runner permitting Unix socket bind; current sandbox denies it')
++    def test_unix_socket_roundtrip(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            path=Path(tmp)/'ipc.sock';server=self.engine.serve(path)
++            try:
++                with patch.object(helper,'SOCKET',str(path)),patch.dict(os.environ,{'HA_VERIFICATION_CAPABILITY':self.cap}):
++                    self.assertEqual(helper.send(self.request())['status'],'SUCCESS')
++                self.assertEqual(path.stat().st_mode&0o777,0o600)
++            finally:server.shutdown();server.server_close()
++    @unittest.skipUnless(os.environ.get('HA_BRIDGE_REAL_IPC_TEST')=='1', 'Requires runner permitting Unix socket bind; current sandbox denies it')
++    def test_oversized_ipc_rejected(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            path=Path(tmp)/'ipc.sock';server=self.engine.serve(path)
++            try:
++                with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:
++                    s.connect(str(path));s.sendall(b'x'*16385+b'\n');result=json.loads(s.recv(8192))
++                    self.assertEqual(result['status'],'unavailable')
++                self.assertFalse(self.client.calls)
++            finally:server.shutdown();server.server_close()
++    def test_malformed_json_ipc(self):
++        with self.assertRaises(ValueError):bridge.strict_json('{')
++    def test_duplicate_json_ipc(self):
++        with self.assertRaises(ValueError):bridge.strict_json('{"operation":"ha.ping","operation":"ha.restart_core"}')
++    def test_nonfinite_json(self):
++        with self.assertRaises(ValueError):bridge.strict_json('{"value":NaN}')
++    def test_mock_ipc_roundtrip(self):
++        engine=self.engine
++        class Socket:
++            def __enter__(self):return self
++            def __exit__(self,*args):pass
++            def settimeout(self,value):self.timeout=value
++            def connect(self,path):self.path=path
++            def sendall(self,raw):self.result=engine.dispatch(bridge.strict_json(raw));self.raw=raw
++            def recv(self,n):return json.dumps(self.result).encode()+b'\n'
++        s=Socket()
++        with patch.object(helper.socket,'socket',return_value=s) as constructor,patch.dict(os.environ,{'HA_VERIFICATION_CAPABILITY':self.cap}):
++            self.assertEqual(helper.send(self.request())['status'],'SUCCESS')
++            constructor.assert_called_once_with(socket.AF_UNIX,socket.SOCK_STREAM)
++            self.assertEqual(s.path,'/data/verification.sock');self.assertEqual(s.timeout,40)
++            self.assertNotIn(b'Authorization',s.raw)
++    def test_helper_request_limit_before_connect(self):
++        with patch.dict(os.environ,{'HA_VERIFICATION_CAPABILITY':self.cap}),patch.object(helper.socket,'socket') as sock:
++            with self.assertRaises(helper.Invalid):helper.send(self.request('ha.call_service',domain='codex_cli',service='area_create',data={'name':'x'*20000}))
++            sock.assert_not_called()
++    def test_helper_duplicate_json_rejected(self):
++        with self.assertRaises(ValueError):helper.load('{"name":"a","name":"b"}')
++    def test_service_url_in_data_rejected(self):
++        self.assertEqual(self.dispatch(self.call(data={'area_id':'x','url':'http://bad'}))['status'],'VALIDATION_ERROR')
++
++
++class ParentCredentials(unittest.TestCase):
++    def test_parent_token_available(self):
++        with patch.dict(os.environ,{'SUPERVISOR_TOKEN':'isolated-parent-fixture'}):self.assertTrue(bridge.SupervisorClient().available())
++    def test_parent_without_token(self):
++        with patch.dict(os.environ,{},clear=True):self.assertFalse(bridge.SupervisorClient().available())
++    def test_parent_token_absent_from_failure_audit(self):
++        fixture='isolated-parent-token-fixture'
++        worker=Worker();engine=verification.Verification(worker)
++        engine.capabilities['task']='cap-fixture'
++        opener=types.SimpleNamespace(open=lambda *a,**kw: (_ for _ in ()).throw(OSError(fixture)))
++        request={'operation':'ha.call_service','domain':'codex_cli','service':'area_get','data':{'area_id':'kitchen'},'request_id':secrets.token_hex(16),'capability':'cap-fixture'}
++        with patch.dict(os.environ,{'SUPERVISOR_TOKEN':fixture}),patch.object(bridge.urllib.request,'build_opener',return_value=opener),self.assertLogs(bridge.LOG,level='INFO') as logs:
++            result=engine.dispatch(request)
++        self.assertEqual(result['status'],'UNKNOWN')
++        self.assertNotIn(fixture,json.dumps(result));self.assertNotIn(fixture,str(logs.output));self.assertNotIn('Authorization',str(logs.output))
++    def test_codex_env_sanitized_even_with_legacy_option(self):
++        import server
++        with patch.dict(os.environ,{'SUPERVISOR_TOKEN':'isolated-parent-fixture','HASSIO_TOKEN':'isolated-parent-fixture','HA_TOKEN':'fixture'},clear=True),patch.object(server,'read_options',return_value={'HA_TOKEN':'legacy-option-fixture'}):
++            result=server.codex_env()
++            for name in ('SUPERVISOR_TOKEN','HASSIO_TOKEN','HA_TOKEN','HA_URL'):self.assertNotIn(name,result)
++    def test_helper_does_not_read_parent_token(self):
++        text=(ROOT/'ha-codex-ha').read_text()
++        self.assertNotIn('SUPERVISOR_TOKEN',text);self.assertNotIn('HA_TOKEN',text);self.assertNotIn('urllib',text);self.assertNotIn('Authorization',text)
++    def test_http_headers_internal_and_timeout(self):
++        response=types.SimpleNamespace(status=200,read=lambda n:b'{"message":"isolated-parent-fixture","password":"fixture"}')
++        cm=contextlib.nullcontext(response);seen=[]
++        def open_(req,timeout):seen.append((req,timeout));return cm
++        opener=types.SimpleNamespace(open=open_)
++        with patch.dict(os.environ,{'SUPERVISOR_TOKEN':'isolated-parent-fixture'}),patch.object(bridge.urllib.request,'build_opener',return_value=opener):
++            result=bridge.SupervisorClient().request('GET','/core/api/')
++            self.assertEqual(seen[0][0].full_url,'http://supervisor/core/api/');self.assertEqual(seen[0][1],15)
++            self.assertNotIn('isolated-parent-fixture',json.dumps(result));self.assertEqual(result['password'],'[REDACTED]')
++    def test_redirect_denied(self):
++        with self.assertRaises(bridge.Unavailable):bridge.NoRedirect().redirect_request(None,None,302,'',{},'http://bad')
++    def test_helper_restart_mapping(self):
++        seen=[]
++        def sender(request):seen.append(request);return {'status':'SUCCESS'}
++        with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(helper.main(['restart-core'],sender),0)
++        self.assertEqual(set(seen[0]),{'operation','request_id'});self.assertEqual(seen[0]['operation'],'ha.restart_core')
++    def test_helper_no_retry(self):
++        seen=[]
++        def sender(request):seen.append(request);raise OSError()
++        with contextlib.redirect_stderr(io.StringIO()):self.assertEqual(helper.main(['restart-core'],sender),1)
++        self.assertEqual(len(seen),1)
++    def test_helper_missing_capability(self):
++        with patch.dict(os.environ,{},clear=True):
++            with self.assertRaises(helper.Invalid):helper.send({'operation':'ha.ping','request_id':'a'*32})
++
++
++if __name__=='__main__':unittest.main()
+diff --git a/codex-cli-worker/Dockerfile b/codex-cli-worker/Dockerfile
+index 3164442..60a43b0 100644
+--- a/codex-cli-worker/Dockerfile
++++ b/codex-cli-worker/Dockerfile
+@@ -57,8 +57,10 @@ WORKDIR /data
+ COPY run.sh /
+ COPY server.py /
+ COPY verification.py verification_mcp.py browser.cjs browser_resources.cjs /
++COPY trusted_ha_bridge.py /
++COPY ha-codex-ha /usr/local/bin/ha-codex-ha
+ COPY web /web
+ 
+-RUN chmod a+x /run.sh /server.py
++RUN chmod a+x /run.sh /server.py /usr/local/bin/ha-codex-ha
+ 
+ CMD ["/run.sh"]
+diff --git a/codex-cli-worker/config.yaml b/codex-cli-worker/config.yaml
+index e2ada4c..7cb95a8 100644
+--- a/codex-cli-worker/config.yaml
++++ b/codex-cli-worker/config.yaml
+@@ -1,9 +1,8 @@
+-name: Codex CLI Worker
++name: Codex CLI Worker Trusted HA Bridge
+ description: Run Codex CLI tasks against the Home Assistant config folder.
+-version: "0.1.70"
++version: "0.1.70-haipc1"
+ slug: codex_cli_worker
+ url: https://github.com/moryoav/home-assistant-codex
+-image: ghcr.io/moryoav/codex-cli-worker
+ init: false
+ startup: services
+ boot: manual
+@@ -20,6 +19,8 @@ map:
+     read_only: false
+     path: /config
+ homeassistant_api: true
++hassio_api: true
++hassio_role: default
+ backup_exclude:
+   - "*/ha-docs*"
+ discovery:
+diff --git a/codex-cli-worker/ha-codex-ha b/codex-cli-worker/ha-codex-ha
+new file mode 100755
+index 0000000..fbe2fb1
+--- /dev/null
++++ b/codex-cli-worker/ha-codex-ha
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""Local IPC client only. No HTTP library, HA credentials or socket path option."""
++import argparse
++import json
++import os
++import secrets
++import socket
++import sys
++
++SOCKET = '/data/verification.sock'
++MAX_REQUEST = 16384
++MAX_RESPONSE = 2 * 1024 * 1024
++
++
++class Invalid(ValueError): pass
++
++
++def pairs(items):
++    result = {}
++    for key, value in items:
++        if key in result: raise Invalid('Duplicate JSON field')
++        result[key] = value
++    return result
++
++
++def load(raw):
++    def bad(value): raise Invalid('Non-finite JSON')
++    return json.loads(raw, object_pairs_hook=pairs, parse_constant=bad)
++
++
++def send(request):
++    capability = os.environ.get('HA_VERIFICATION_CAPABILITY')
++    if not capability: raise Invalid('Active task capability is unavailable')
++    raw = json.dumps({**request,'capability':capability},allow_nan=False).encode()+b'\n'
++    if len(raw) > MAX_REQUEST: raise Invalid('IPC request exceeds size limit')
++    # Single connection, single request, no automatic retry even after disconnect.
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
++        connection.settimeout(40)
++        connection.connect(SOCKET)
++        connection.sendall(raw)
++        reply = bytearray()
++        while b'\n' not in reply:
++            chunk = connection.recv(8192)
++            if not chunk: raise OSError()
++            reply.extend(chunk)
++            if len(reply) > MAX_RESPONSE: raise Invalid('IPC response exceeds size limit')
++    return load(bytes(reply).split(b'\n',1)[0])
++
++
++def main(argv=None, sender=send):
++    parser = argparse.ArgumentParser(description='HA via private trusted-worker IPC; no HA token')
++    subs = parser.add_subparsers(dest='command',required=True)
++    for name in ('ping','config','services','restart-core'): subs.add_parser(name)
++    call = subs.add_parser('call')
++    call.add_argument('domain');call.add_argument('service');call.add_argument('json')
++    args = parser.parse_args(argv)
++    op = 'ha.call_service' if args.command=='call' else 'ha.restart_core' if args.command=='restart-core' else 'ha.'+args.command
++    request = {'operation':op,'request_id':secrets.token_hex(16)}
++    try:
++        if args.command=='call':
++            data=load(args.json)
++            if not isinstance(data,dict): raise Invalid('Service JSON must be an object')
++            request.update(domain=args.domain,service=args.service,data=data)
++        result = sender(request)
++        print(json.dumps(result,ensure_ascii=False))
++        return 0 if isinstance(result,dict) and result.get('status') in ('SUCCESS','NO_CHANGE','ALREADY_EXISTS') else 1
++    except (Invalid, ValueError, UnicodeError, RecursionError):
++        print('ERROR: Invalid local bridge request or response',file=sys.stderr)
++        return 1
++    except OSError:
++        print('ERROR: Bridge unavailable or timed out; mutation outcome may be UNKNOWN; do not retry automatically',file=sys.stderr)
++        return 1
++
++
++if __name__=='__main__': sys.exit(main())
+diff --git a/codex-cli-worker/server.py b/codex-cli-worker/server.py
+index 4b33487..ce882e6 100644
+--- a/codex-cli-worker/server.py
++++ b/codex-cli-worker/server.py
+@@ -3250,8 +3250,8 @@ def codex_env() -> dict[str, str]:
+     """Return the environment Codex processes run in.
+ 
+     The Supervisor tokens and the verification capability are removed, HOME and
+-    CODEX_HOME point into the add-on's data folder, and HA_TOKEN is set only
+-    from the add-on option, together with HA_URL, the address it works at.
++    CODEX_HOME point into the add-on's data folder. Home Assistant credentials
++    are never passed to Codex; the local helper uses task-scoped IPC.
+     """
+     env = dict(os.environ)
+     for key in ("SUPERVISOR_TOKEN", "HASSIO_TOKEN", "HA_TOKEN", "HA_URL", "HA_VERIFICATION_CAPABILITY"):
+@@ -3259,10 +3259,6 @@ def codex_env() -> dict[str, str]:
+     env["CODEX_HOME"] = str(CODEX_HOME)
+     env["HOME"] = str(DATA_ROOT)
+     options = read_options()
+-    token = str(options.get("HA_TOKEN") or "").strip()
+-    if token:
+-        env["HA_TOKEN"] = token
+-        env["HA_URL"] = codex_ha_url(options)
+     return env
+ 
+ 
+@@ -3313,14 +3309,15 @@ def backup_instructions(backup_dir: Path | None) -> str:
+ 
+ 
+ def home_assistant_api_instructions(options: dict[str, Any]) -> str:
+-    """Tell Codex where its own Home Assistant API calls go; empty when the add-on gives it no token for them."""
+-    if not str(options.get("HA_TOKEN") or "").strip():
+-        return ""
++    """Describe the finite local helper; no direct HA credentials are supplied."""
+     return (
+-        "For Home Assistant API calls you make yourself, such as a reload or a restart the user asked for, use the "
+-        "HA_URL and HA_TOKEN environment variables: send the request to $HA_URL, for example "
+-        '$HA_URL/api/services/automation/reload, with the header "Authorization: Bearer $HA_TOKEN". '
+-        "Do not use http://supervisor/core, which does not accept this token, and never print the token.\n\n"
++        "Use ha-codex-ha ping, config, or services for the fixed HA read checks. "
++        "The helper uses private local IPC to the trusted worker; it never receives HA credentials. "
++        "Use ha-codex-ha call codex_cli <service> '<json>' only for a user-authorized registry operation "
++        "in its explicit eleven-service allowlist. No arbitrary HA services or URLs are available. "
++        "ha-codex-ha restart-core is a separate operation: call it only after explicit user authorization "
++        "and a fresh passing Home Assistant configuration check. Never retrieve or pass Supervisor/HA tokens, "
++        "never connect to the worker socket directly, and keep browser verification read-only.\n\n"
+     )
+ 
+ 
+diff --git a/codex-cli-worker/trusted_ha_bridge.py b/codex-cli-worker/trusted_ha_bridge.py
+new file mode 100644
+index 0000000..6d9e1be
+--- /dev/null
++++ b/codex-cli-worker/trusted_ha_bridge.py
+@@ -0,0 +1,188 @@
++"""Finite trusted-parent HA bridge, using the existing private verification IPC."""
++import hashlib
++import json
++import logging
++import os
++import re
++import threading
++import urllib.error
++import urllib.request
++
++OPS = {'ha.ping', 'ha.config', 'ha.services', 'ha.call_service', 'ha.restart_core'}
++SERVICES = {
++    'area_get': {'area_id', 'area_name'},
++    'area_create': {'name', 'floor_id', 'icon', 'aliases'},
++    'area_update': {'area_id', 'area_name', 'name', 'floor_id', 'icon', 'aliases'},
++    'area_set_temperature_entity': {'area_id', 'area_name', 'entity_id'},
++    'floor_get': {'floor_id', 'floor_name'},
++    'floor_create': {'name', 'level', 'icon', 'aliases'},
++    'floor_update': {'floor_id', 'floor_name', 'name', 'level', 'icon', 'aliases'},
++    'entity_registry_get': {'entity_id'},
++    'entity_registry_update': {'entity_id', 'name', 'icon', 'area_id', 'disabled_by', 'hidden_by', 'entity_category'},
++    'device_registry_get': {'device_id'},
++    'device_registry_update': {'device_id', 'name_by_user', 'area_id', 'disabled_by'},
++}
++LOG = logging.getLogger('codex.trusted_ha_bridge')
++if not LOG.handlers:
++    handler = logging.StreamHandler()
++    handler.setFormatter(logging.Formatter('%(asctime)s HA_BRIDGE %(message)s'))
++    LOG.addHandler(handler)
++LOG.setLevel(logging.INFO)
++LOG.propagate = False
++
++
++class Invalid(ValueError): pass
++class Unavailable(Exception): pass
++
++
++def strict_pairs(items):
++    out = {}
++    for key, value in items:
++        if key in out: raise Invalid('Duplicate JSON field')
++        out[key] = value
++    return out
++
++
++def strict_json(raw):
++    def reject_constant(value): raise Invalid('Non-finite JSON')
++    return json.loads(raw, object_pairs_hook=strict_pairs, parse_constant=reject_constant)
++
++
++def validate(request):
++    if not isinstance(request, dict): raise Invalid()
++    op = request.get('operation')
++    if not isinstance(op, str) or op not in OPS: raise Invalid()
++    fields = {'operation', 'request_id'} | ({'domain', 'service', 'data'} if op == 'ha.call_service' else set())
++    if set(request) != fields: raise Invalid()
++    if not isinstance(request['request_id'], str) or not re.fullmatch('[a-f0-9]{32}', request['request_id']): raise Invalid()
++    if op != 'ha.call_service': return
++    domain, service, data = request['domain'], request['service'], request['data']
++    if domain != 'codex_cli' or not isinstance(service, str) or service not in SERVICES: raise Invalid()
++    if not isinstance(data, dict) or set(data) - SERVICES[service]: raise Invalid()
++    if service.startswith('area_') and service != 'area_create':
++        if ('area_id' in data) == ('area_name' in data): raise Invalid()
++    if service in ('floor_get', 'floor_update'):
++        if ('floor_id' in data) == ('floor_name' in data): raise Invalid()
++    required = {'name'} if service in ('area_create', 'floor_create') else {'entity_id'} if (
++        service.startswith('entity_registry_') or service == 'area_set_temperature_entity') else {'device_id'} if service.startswith('device_registry_') else set()
++    if not required <= set(data): raise Invalid()
++    for key, value in data.items():
++        if key == 'aliases':
++            if not isinstance(value, list) or len(value) > 100 or any(not isinstance(v, str) or not v.strip() or len(v) > 255 for v in value): raise Invalid()
++        elif key == 'level':
++            if type(value) is not int and not (value is None and service == 'floor_create'): raise Invalid()
++        elif value is None:
++            nullable = {'icon', 'disabled_by', 'hidden_by', 'entity_category', 'name_by_user'}
++            if key == 'name' and service == 'entity_registry_update': continue
++            if key == 'entity_id' and service == 'area_set_temperature_entity': continue
++            if key == 'area_id' and service in ('entity_registry_update', 'device_registry_update'): continue
++            if key == 'floor_id' and service in ('area_create', 'area_update'): continue
++            if key not in nullable: raise Invalid()
++        elif not isinstance(value, str) or not value.strip() or len(value) > 255: raise Invalid()
++        elif key in ('disabled_by', 'hidden_by') and value != 'user': raise Invalid()
++        elif key == 'entity_category' and value not in ('config', 'diagnostic'): raise Invalid()
++
++
++def redact(value, token):
++    if isinstance(value, dict):
++        return {key: '[REDACTED]' if re.search('token|password|secret|cookie|authorization|private.?key|api.?key', key, re.I)
++                else redact(item, token) for key, item in value.items()}
++    if isinstance(value, list): return [redact(item, token) for item in value]
++    if isinstance(value, str) and token: return value.replace(token, '[REDACTED]')
++    return value
++
++
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *args): raise Unavailable('Redirect denied')
++
++
++class SupervisorClient:
++    """Used exclusively by trusted parent; no credential output or persistence."""
++    def available(self): return bool(os.environ.get('SUPERVISOR_TOKEN'))
++
++    def request(self, method, path, data=None):
++        token = os.environ.get('SUPERVISOR_TOKEN')
++        if not token: raise Unavailable('Parent Supervisor authentication unavailable')
++        body = json.dumps(data, allow_nan=False).encode() if data is not None else None
++        req = urllib.request.Request('http://supervisor'+path, method=method, data=body,
++            headers={'Authorization':'Bearer '+token, 'Content-Type':'application/json'})
++        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
++        try:
++            with opener.open(req, timeout=15) as response:
++                if not 200 <= response.status < 300: raise Unavailable('Non-2xx response')
++                raw = response.read(2*1024*1024+1)
++                if len(raw) > 2*1024*1024: raise Unavailable('Response limit exceeded')
++            return redact(strict_json(raw) if raw else {}, token)
++        except Exception:
++            # Do not leak headers, body, HTTP exceptions or upstream diagnostics.
++            raise Unavailable('Supervisor request failed') from None
++
++
++class Bridge:
++    def __init__(self, verification, client=None):
++        self.verification = verification
++        self.client = client or SupervisorClient()
++        self.lock = threading.Lock()
++        self.mutations = {}  # Bounded process-local deduplication, no journal/token file.
++
++    def run(self, task_id, request, capability):
++        try: validate(request)
++        except (ValueError, TypeError): return {'status':'VALIDATION_ERROR', 'message':'Invalid bridge request'}
++        op, request_id = request['operation'], request['request_id']
++        with self.lock:
++            worker = self.verification.worker
++            with worker.lock: turn_id = worker.tasks.get(task_id, {}).get('current_turn_id')
++            if not self.verification.active(task_id, turn_id, capability):
++                return {'status':'PERMISSION_DENIED', 'request_id':request_id}
++            if op == 'ha.restart_core':
++                LOG.info('START operation=%s request_id=%s task_id=%s', op, request_id, task_id)
++                LOG.info('RESULT operation=%s request_id=%s status=PERMISSION_DENIED', op, request_id)
++                return {'status':'PERMISSION_DENIED', 'request_id':request_id,
++                        'message':'Core restart is disabled by worker policy'}
++            mutation = op == 'ha.call_service'
++            digest = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()
++            if mutation and request_id in self.mutations:
++                previous = self.mutations[request_id]
++                if previous[:3] != (task_id, turn_id, digest):
++                    return {'status':'PERMISSION_DENIED', 'request_id':request_id}
++                return previous[3]  # No repeated API call, including UNKNOWN outcomes.
++            if mutation and len(self.mutations) >= 1024:
++                return {'status':'UNAVAILABLE', 'request_id':request_id, 'message':'Bridge mutation ledger full'}
++            if not self.client.available():
++                return {'status':'UNAVAILABLE', 'request_id':request_id, 'message':'Trusted parent authentication unavailable'}
++            unknown = {'status':'UNKNOWN', 'request_id':request_id, 'message':'Outcome unknown; never retry the mutation automatically'}
++            if mutation: self.mutations[request_id] = (task_id, turn_id, digest, unknown)
++            LOG.info('START operation=%s request_id=%s task_id=%s', op, request_id, task_id)
++            try:
++                result = self.perform(request)
++                result['request_id'] = request_id
++                if mutation and not self.verification.active(task_id, turn_id, capability): result = unknown
++            except Exception:
++                result = unknown if mutation else {'status':'UNAVAILABLE', 'request_id':request_id, 'message':'Trusted API check unavailable'}
++            if mutation: self.mutations[request_id] = (task_id, turn_id, digest, result)
++            LOG.info('RESULT operation=%s request_id=%s status=%s', op, request_id, result['status'])
++            return result
++
++    def perform(self, r):
++        op = r['operation']
++        if op == 'ha.ping':
++            self.client.request('GET', '/core/api/')
++            return {'status':'SUCCESS', 'core_api_reachable':True}
++        if op == 'ha.config':
++            data = self.client.request('GET', '/core/api/config')
++            return {'status':'SUCCESS', 'result':{key:data[key] for key in ('version','state','location_name','time_zone','unit_system','country') if key in data}}
++        if op == 'ha.services':
++            data = self.client.request('GET', '/core/api/services')
++            if not isinstance(data, list): raise Unavailable()
++            domains = {row['domain']:sorted(row['services']) for row in data if isinstance(row, dict)
++                       and isinstance(row.get('domain'), str) and isinstance(row.get('services'), dict)}
++            missing = sorted(set(SERVICES)-set(domains.get('codex_cli', [])))
++            return {'status':'SUCCESS', 'services':domains, 'missing_registry_services':missing, 'all_11_visible':not missing}
++        if op == 'ha.restart_core':
++            return {'status':'PERMISSION_DENIED', 'message':'Core restart is disabled by worker policy'}
++        result = self.client.request('POST', '/core/api/services/codex_cli/'+r['service']+'?return_response', r['data'])
++        body = result.get('service_response') if isinstance(result, dict) else None
++        statuses = {'SUCCESS','NO_CHANGE','ALREADY_EXISTS','VALIDATION_ERROR','NOT_FOUND','PERMISSION_DENIED','WRITE_FAILED','VERIFY_FAILED'}
++        if not isinstance(body, dict) or body.get('status') not in statuses: raise Unavailable()
++        safe = {key:body[key] for key in ('status','before','requested','after','verified','message') if key in body}
++        return {'status':body['status'], 'result':safe}
+diff --git a/codex-cli-worker/verification.py b/codex-cli-worker/verification.py
+index 4141a0d..a375b58 100644
+--- a/codex-cli-worker/verification.py
++++ b/codex-cli-worker/verification.py
+@@ -11,6 +11,7 @@ import socketserver
+ import subprocess
+ import tempfile
+ import threading
++from trusted_ha_bridge import Bridge, strict_json
+ import time
+ from contextlib import closing
+ from pathlib import Path
+@@ -37,6 +38,7 @@ class Verification:
+         self.capabilities = {}
+         self.lock = threading.RLock()
+         self.execution_lock = threading.Lock()
++        self.ha_bridge = Bridge(self)
+ 
+     def begin(self, task_id):
+         """Issue a new capability for the task's turn, clear its recorded checks, and delete expired screenshots."""
+@@ -67,7 +69,10 @@ class Verification:
+         with self.worker.lock:
+             if self.worker.tasks.get(task_id, {}).get("status") != "running":
+                 raise ValueError("Verification capability expired")
+-        return self.run(task_id, {k: v for k, v in payload.items() if k != "capability"}, supplied)
++        request = {k: v for k, v in payload.items() if k != "capability"}
++        if isinstance(request.get("operation"), str) and request["operation"].startswith("ha."):
++            return self.ha_bridge.run(task_id, request, supplied)
++        return self.run(task_id, request, supplied)
+ 
+     def active(self, task_id, turn_id, capability):
+         """Reject checks that outlive cancellation, completion, or a replaced turn."""
+@@ -405,8 +410,8 @@ class Verification:
+                     raw = self.rfile.readline(16385)
+                     if len(raw) > 16384:
+                         raise ValueError("Request too large")
+-                    result = engine.dispatch(json.loads(raw))
+-                except (OSError, ValueError):
++                    result = engine.dispatch(strict_json(raw))
++                except (OSError, ValueError, TypeError, RecursionError):
+                     result = {"status": "unavailable", "message": "Invalid or expired verification request"}
+                 try:
+                     self.wfile.write(json.dumps(result).encode() + b"\n")

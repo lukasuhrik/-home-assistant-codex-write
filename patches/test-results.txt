@@ -1,0 +1,9 @@
+Command: python -B -m unittest discover -s tests
+Working directory: /config/dev/mvp-write-v1
+Kind: existing isolated mocks/stubs; no live HA
+
+..........................................................
+----------------------------------------------------------------------
+Ran 58 tests in 0.144s
+
+OK
