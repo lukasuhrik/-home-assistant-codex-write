@@ -45,18 +45,19 @@ jobs:
     name: Patch import gate
     needs: pins
     runs-on: ubuntu-latest
+    outputs:
+      patch_present: ${{ steps.patch.outputs.present }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check MVP patch presence
+      - name: Check MVP patch presence and checksum
         id: patch
         shell: bash
         run: |
           if [[ -s patches/mvp-write-v1.patch && -f patches/mvp-write-v1.sha256 ]]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
-            sha256sum -c patches/mvp-write-v1.sha256
+            (cd patches && sha256sum -c mvp-write-v1.sha256)
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "MVP patch not imported yet. Bootstrap checks passed; RC tests remain intentionally blocked."
           fi
       - name: Release-gate status
         run: |
@@ -73,7 +74,7 @@ jobs:
   rc:
     name: Full RC contract/build gate
     needs: patch-gate
-    if: "${{ hashFiles('patches/mvp-write-v1.patch') != '' }}"
+    if: needs.patch-gate.outputs.patch_present == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -101,7 +102,7 @@ jobs:
         run: |
           if [[ -d upstream/tests ]]; then python -m pytest -q upstream/tests; fi
           if [[ -d rc-tests ]]; then python -m pytest -q rc-tests; fi
-      - name: Require RC harness
+      - name: Require real RC harness
         run: |
           test -f rc-tests/test_core_contract.py
           test -f rc-tests/test_endpoint_contract.py
