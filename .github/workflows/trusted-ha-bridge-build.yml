@@ -54,7 +54,10 @@ jobs:
 
       - name: Worker regression tests
         working-directory: upstream
-        run: python -m pytest -q codex-cli-worker/tests/test_server.py codex-cli-worker/tests/test_verification.py codex-cli-worker/tests/test_config_check.py
+        run: |
+          # The trusted bridge deliberately removes HA_TOKEN/HA_URL from the Codex child environment.
+          # Upstream's legacy token-forwarding test is therefore superseded by the stricter bridge tests above.
+          python -m pytest -q             codex-cli-worker/tests/test_server.py             codex-cli-worker/tests/test_verification.py             codex-cli-worker/tests/test_config_check.py             -k "not test_token_option_comes_with_the_address_it_works_at"
 
   build:
     needs: test
