@@ -1,0 +1,29 @@
+#!/usr/bin/with-contenv bashio
+set -euo pipefail
+
+mkdir -p /data/codex-home /config/codex_tasks
+export CODEX_HOME=/data/codex-home
+export HOME=/data
+export PYTHONDONTWRITEBYTECODE=1
+
+token_file=/data/worker_api_token
+legacy_token="$(python3 -c 'import json, pathlib; p=pathlib.Path("/data/options.json"); data=json.loads(p.read_text()) if p.exists() else {}; print(data.get("api_token") or "")')"
+
+if [ ! -s "${token_file}" ]; then
+    if [ -n "${legacy_token}" ]; then
+        printf '%s' "${legacy_token}" > "${token_file}"
+        bashio::log.info "Migrated worker API token from app options into private app storage."
+    else
+        python3 -c 'import pathlib, secrets; pathlib.Path("/data/worker_api_token").write_text(secrets.token_urlsafe(32), encoding="utf-8")'
+        bashio::log.info "Generated a random worker API token in private app storage."
+    fi
+    chmod 600 "${token_file}"
+fi
+
+if [ -n "${legacy_token}" ]; then
+    bashio::addon.option 'api_token'
+    bashio::log.info "Removed legacy worker API token from app options."
+fi
+
+echo "Codex CLI Worker starting"
+python3 /server.py

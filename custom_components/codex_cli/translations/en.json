@@ -1,0 +1,125 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Codex",
+        "description": "Codex automatically detects the installed Codex CLI Worker app and its generated worker API token."
+      },
+      "reauth_confirm": {
+        "title": "Codex",
+        "description": "Reconnect to the installed Codex CLI Worker app."
+      },
+      "reconfigure": {
+        "title": "Codex",
+        "description": "Reconnect to the installed Codex CLI Worker app."
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not discover or connect to the Codex CLI Worker app. Make sure it is installed, started, and has generated its worker API token.",
+      "invalid_auth": "The worker rejected its generated API token. Restart the Codex CLI Worker app and try again."
+    },
+    "abort": {
+      "already_configured": "Codex is already configured.",
+      "cannot_connect": "Could not discover or connect to the Codex CLI Worker app.",
+      "reauth_successful": "Codex was reconnected.",
+      "reconfigure_successful": "Codex was reconfigured.",
+      "unknown": "The Codex config entry could not be found."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_task": {
+        "name": "Last task"
+      },
+      "active_tasks": {
+        "name": "Active tasks"
+      },
+      "auth_status": {
+        "name": "Auth status"
+      },
+      "five_hour_limit": {
+        "name": "5-hour limit"
+      },
+      "five_hour_reset": {
+        "name": "5-hour reset"
+      },
+      "weekly_limit": {
+        "name": "Weekly limit"
+      },
+      "weekly_reset": {
+        "name": "Weekly reset"
+      }
+    },
+    "binary_sensor": {
+      "task_running": {
+        "name": "Task running"
+      }
+    }
+  },
+  "issues": {
+    "codex_not_signed_in": {
+      "title": "Codex is not signed in",
+      "description": "The Codex worker is reachable, but Codex CLI is not signed in. Start the Codex sign-in flow from the add-on web UI or by running the `codex_cli.start_login` action."
+    }
+  },
+  "services": {
+    "continue_task": {
+      "name": "Continue task",
+      "description": "Send a new message to a saved Codex conversation.",
+      "fields": {
+        "task_id": {
+          "name": "Task ID",
+          "description": "The saved task to continue."
+        },
+        "message": {
+          "name": "Message",
+          "description": "The follow-up message for Codex."
+        }
+      }
+    },
+    "reply_task": {
+      "name": "Reply to task",
+      "description": "Answer the question of a Codex task that is waiting for input.",
+      "fields": {
+        "task_id": {
+          "name": "Task ID",
+          "description": "The task that is waiting for input."
+        },
+        "reply": {
+          "name": "Reply",
+          "description": "Your answer. To pick one of the choices Codex offered, send that choice's text."
+        },
+        "turn_id": {
+          "name": "Turn ID",
+          "description": "The turn that asked the question, from `turn_id` in the `codex_cli_task_result` event. When set, the reply is refused once that question is no longer the one waiting."
+        }
+      }
+    },
+    "list_tasks": {
+      "name": "List tasks",
+      "description": "Get all tasks or a filtered page of saved conversations.",
+      "fields": {
+        "limit": {
+          "name": "Limit",
+          "description": "Maximum number of tasks to return (1–500). Omit to return all tasks."
+        },
+        "offset": {
+          "name": "Offset",
+          "description": "Number of matching tasks to skip."
+        },
+        "status": {
+          "name": "Status",
+          "description": "Only return tasks with this status."
+        },
+        "order": {
+          "name": "Order",
+          "description": "Order by creation time (oldest first) or latest activity (newest first)."
+        },
+        "summary": {
+          "name": "Compact summaries",
+          "description": "Return short entries instead of full task records."
+        }
+      }
+    }
+  }
+}

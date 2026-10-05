@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <title>Codex · Home Assistant</title>
+    <link rel="stylesheet" href="assets/chat.css" />
+    <script src="assets/vendor/marked.umd.js" defer></script>
+    <script src="assets/markdown.js" defer></script>
+    <script src="assets/chat.js" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <button
+        class="scrim"
+        id="scrim"
+        aria-label="Close conversations"
+        hidden
+      ></button>
+      <aside id="sidebar" aria-label="Conversations">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">⌘</span
+          ><strong>Codex</strong><span class="tag">HOME ASSISTANT</span
+          ><button
+            id="close-sidebar"
+            class="icon mobile"
+            aria-label="Close conversations"
+          >
+            ✕
+          </button>
+        </div>
+        <button id="new-chat" class="new-chat">
+          <span aria-hidden="true">＋</span> New chat
+        </button>
+        <div class="list-heading">
+          <span>Your chats</span
+          ><button id="refresh" class="icon" aria-label="Refresh conversations">
+            ↻
+          </button>
+        </div>
+        <p id="sidebar-error" class="sidebar-error" role="alert" hidden></p>
+        <nav id="chat-list" aria-label="Saved chats"></nav>
+        <p id="list-empty" class="muted">
+          Your conversations will appear here.
+        </p>
+        <button id="load-more" class="subtle" hidden>Load older chats</button>
+        <div class="sidebar-footer">
+          <div class="workspace-label">
+            <span class="workspace-dot" aria-hidden="true"></span
+            ><span>Home Assistant workspace</span
+            ><button
+              id="settings-button"
+              class="icon"
+              aria-label="Open settings"
+            >
+              ⚙
+            </button>
+          </div>
+          <div id="usage" class="usage" aria-label="Remaining account quota">
+            <span>5h</span>
+            <span class="usage-bar unknown" aria-hidden="true"
+              ><span id="usage-five-hour-bar"></span
+            ></span>
+            <strong id="usage-five-hour">Unavailable</strong>
+            <span>7d</span>
+            <span class="usage-bar unknown" aria-hidden="true"
+              ><span id="usage-weekly-bar"></span
+            ></span>
+            <strong id="usage-weekly">Unavailable</strong>
+          </div>
+          <p id="usage-note" class="usage-note" role="status">Loading quota…</p>
+        </div>
+      </aside>
+      <div
+        id="divider"
+        role="separator"
+        aria-label="Resize conversations sidebar"
+        aria-orientation="vertical"
+        aria-valuemin="220"
+        aria-valuemax="440"
+        aria-valuenow="280"
+        tabindex="0"
+      ></div>
+      <main>
+        <header class="chat-header">
+          <button
+            id="menu"
+            class="icon mobile"
+            aria-label="Open conversations"
+            aria-expanded="false"
+          >
+            ☰
+          </button>
+          <div class="chat-heading">
+            <h1 id="chat-title">New chat</h1>
+            <p id="chat-status">Your Home Assistant, with a little help.</p>
+          </div>
+          <button id="cancel" class="subtle" hidden>Stop task</button>
+        </header>
+        <div
+          id="messages"
+          class="messages"
+          tabindex="0"
+          aria-label="Conversation"
+        >
+          <div class="welcome">
+            <div class="welcome-icon" aria-hidden="true">⌘</div>
+            <p class="eyebrow">CODEX FOR HOME ASSISTANT</p>
+            <h2>What would you like to work on?</h2>
+            <p>Start something new, or pick up where you left off.</p>
+            <div class="suggestions">
+              <button
+                data-prompt="Review my automations and suggest improvements. Do not make changes yet."
+              >
+                <span>Review automations</span
+                ><small>Find ways to simplify your setup</small></button
+              ><button
+                data-prompt="Check my dashboard configuration for problems. Do not make changes yet."
+              >
+                <span>Check a dashboard</span
+                ><small>Take a closer look at your config</small>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="compose-area">
+          <p id="notice" role="status" hidden></p>
+          <p id="error" role="alert" hidden></p>
+          <form id="composer">
+            <div id="pending-files" class="pending-files" hidden></div>
+            <label class="sr-only" for="message">Message Codex</label
+            ><textarea
+              id="message"
+              rows="2"
+              placeholder="Ask Codex about your Home Assistant…"
+              required
+            ></textarea>
+            <div class="compose-bottom">
+              <div class="compose-tools">
+                <button
+                  id="attach"
+                  type="button"
+                  aria-label="Attach images"
+                  title="Attach images. You can also paste or drop them here."
+                >
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path
+                      d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"
+                    />
+                  </svg>
+                </button>
+                <input
+                  id="file-input"
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  multiple
+                  hidden
+                />
+              <div id="chat-picker" class="chat-picker">
+                <div class="picker-pill">
+                  <button
+                    id="model-button"
+                    type="button"
+                    aria-label="Select model"
+                    title="Select model"
+                    aria-expanded="false"
+                    aria-controls="model-popover"
+                  >
+                    Model
+                  </button>
+                  <button
+                    id="effort-button"
+                    type="button"
+                    aria-label="Select reasoning level"
+                    aria-expanded="false"
+                    aria-controls="effort-popover"
+                  >
+                    <span id="effort-label">Medium</span
+                    ><svg
+                      class="picker-chevron"
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="m6 9 6 6 6-6" />
+                    </svg>
+                  </button>
+                </div>
+                <div
+                  id="model-popover"
+                  class="picker-popover model-popover"
+                  role="dialog"
+                  aria-label="Select model"
+                  hidden
+                >
+                  <p class="picker-heading">Select model</p>
+                  <div
+                    id="model-options"
+                    role="group"
+                    aria-label="Models"
+                  ></div>
+                </div>
+                <div
+                  id="effort-popover"
+                  class="picker-popover effort-popover"
+                  role="dialog"
+                  aria-label="Select reasoning level"
+                  hidden
+                >
+                  <div class="effort-heading">
+                    <svg
+                      class="effort-bolt"
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linejoin="round"
+                    >
+                      <path d="m13 3-8 10h6l-1 8 9-11h-6l1-7Z" />
+                    </svg>
+                    <div>
+                      <label id="effort-title" for="effort-slider">Medium</label
+                      ><span id="effort-model"></span>
+                    </div>
+                    <button
+                      id="effort-reset"
+                      type="button"
+                      aria-label="Use add-on default reasoning"
+                      title="Use add-on default reasoning"
+                    >
+                      ↺
+                    </button>
+                  </div>
+                  <div class="effort-track">
+                    <div id="effort-dots" aria-hidden="true"></div>
+                    <input
+                      id="effort-slider"
+                      type="range"
+                      min="0"
+                      max="3"
+                      step="1"
+                      value="1"
+                      aria-describedby="effort-description"
+                    />
+                  </div>
+                  <p id="effort-description">
+                    Balances speed and reasoning depth.
+                  </p>
+                </div>
+              </div>
+              </div>
+              <button id="send" type="submit" aria-label="Send message">
+                ↑
+              </button>
+            </div>
+          </form>
+          <p id="compose-hint">A new chat starts a separate conversation.</p>
+          <p class="footnote">
+            Codex can make mistakes. Review changes to your home configuration.
+          </p>
+        </div>
+      </main>
+    </div>
+    <button
+      id="menu-scrim"
+      class="menu-scrim"
+      aria-label="Close chat actions"
+      hidden
+    ></button>
+    <div
+      id="chat-menu"
+      class="chat-menu"
+      role="menu"
+      aria-labelledby="chat-menu-title"
+      hidden
+    >
+      <p id="chat-menu-title" class="chat-menu-title"></p>
+      <button type="button" role="menuitem" data-action="pin">Pin chat</button>
+      <button type="button" role="menuitem" data-action="rename">
+        Rename
+      </button>
+      <button type="button" role="menuitem" data-action="delete" class="danger">
+        Delete
+      </button>
+      <button type="button" role="menuitem" data-action="close">Cancel</button>
+    </div>
+    <dialog id="rename-dialog" class="small-dialog" aria-labelledby="rename-title">
+      <form id="rename-form">
+        <h2 id="rename-title">Rename chat</h2>
+        <label class="sr-only" for="rename-input">Chat title</label
+        ><input
+          id="rename-input"
+          type="text"
+          maxlength="200"
+          autocomplete="off"
+          spellcheck="false"
+          required
+        />
+        <p id="rename-error" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="rename-cancel" class="subtle">
+            Cancel
+          </button>
+          <button type="submit" id="rename-save">Save</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="delete-dialog" class="small-dialog" aria-labelledby="delete-title">
+      <h2 id="delete-title">Delete chat?</h2>
+      <p id="delete-text"></p>
+      <p id="delete-error" class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="delete-cancel" class="subtle">Cancel</button>
+        <button type="button" id="delete-confirm" class="danger">
+          Delete
+        </button>
+      </div>
+    </dialog>
+    <dialog id="settings">
+      <div class="dialog-header">
+        <h2>Settings</h2>
+        <button id="close-settings" class="icon" aria-label="Close settings">
+          ✕
+        </button>
+      </div>
+      <section>
+        <h3>ChatGPT account</h3>
+        <p id="login-status" class="muted">Loading account status…</p>
+        <div class="settings-actions">
+          <button id="login">Sign in</button
+          ><button id="logout" class="subtle">Sign out</button>
+        </div>
+        <div id="login-card"></div>
+      </section>
+      <section>
+        <h3>Workspace instructions</h3>
+        <p class="muted">
+          Codex follows these instructions when working in your Home Assistant
+          configuration.
+        </p>
+        <label for="agents">AGENTS.md</label
+        ><textarea id="agents" rows="12" spellcheck="false"></textarea
+        ><button id="save-agents">Save instructions</button>
+      </section>
+      <p id="settings-result" role="status"></p>
+    </dialog>
+  </body>
+</html>

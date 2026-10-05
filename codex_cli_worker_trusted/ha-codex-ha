@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Local IPC client only. No HTTP library, HA credentials or socket path option."""
+import argparse
+import json
+import os
+import secrets
+import socket
+import sys
+
+SOCKET = '/data/verification.sock'
+MAX_REQUEST = 16384
+MAX_RESPONSE = 2 * 1024 * 1024
+
+
+class Invalid(ValueError): pass
+
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result: raise Invalid('Duplicate JSON field')
+        result[key] = value
+    return result
+
+
+def load(raw):
+    def bad(value): raise Invalid('Non-finite JSON')
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=bad)
+
+
+def send(request):
+    capability = os.environ.get('HA_VERIFICATION_CAPABILITY')
+    if not capability: raise Invalid('Active task capability is unavailable')
+    raw = json.dumps({**request,'capability':capability},allow_nan=False).encode()+b'\n'
+    if len(raw) > MAX_REQUEST: raise Invalid('IPC request exceeds size limit')
+    # Single connection, single request, no automatic retry even after disconnect.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(40)
+        connection.connect(SOCKET)
+        connection.sendall(raw)
+        reply = bytearray()
+        while b'\n' not in reply:
+            chunk = connection.recv(8192)
+            if not chunk: raise OSError()
+            reply.extend(chunk)
+            if len(reply) > MAX_RESPONSE: raise Invalid('IPC response exceeds size limit')
+    return load(bytes(reply).split(b'\n',1)[0])
+
+
+def main(argv=None, sender=send):
+    parser = argparse.ArgumentParser(description='HA via private trusted-worker IPC; no HA token')
+    subs = parser.add_subparsers(dest='command',required=True)
+    for name in ('ping','config','services'): subs.add_parser(name)
+    call = subs.add_parser('call')
+    call.add_argument('domain');call.add_argument('service');call.add_argument('json')
+    args = parser.parse_args(argv)
+    op = 'ha.call_service' if args.command=='call' else 'ha.'+args.command
+    request = {'operation':op,'request_id':secrets.token_hex(16)}
+    try:
+        if args.command=='call':
+            data=load(args.json)
+            if not isinstance(data,dict): raise Invalid('Service JSON must be an object')
+            request.update(domain=args.domain,service=args.service,data=data)
+        result = sender(request)
+        print(json.dumps(result,ensure_ascii=False))
+        return 0 if isinstance(result,dict) and result.get('status') in ('SUCCESS','NO_CHANGE','ALREADY_EXISTS') else 1
+    except (Invalid, ValueError, UnicodeError, RecursionError):
+        print('ERROR: Invalid local bridge request or response',file=sys.stderr)
+        return 1
+    except OSError:
+        print('ERROR: Bridge unavailable or timed out; mutation outcome may be UNKNOWN; do not retry automatically',file=sys.stderr)
+        return 1
+
+
+if __name__=='__main__': sys.exit(main())

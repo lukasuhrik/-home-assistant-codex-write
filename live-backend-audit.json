@@ -1,0 +1,59 @@
+[
+  {
+    "path": "/config/custom_components/codex_cli/registry_services.py",
+    "sha256": "fd62d00daf7244531400ea5aba6a94ced9ae1d660d84475c71529a61218c8901",
+    "syntax": "PASS",
+    "imports": [
+      "from __future__ import annotations",
+      "import asyncio",
+      "from enum import Enum",
+      "import logging",
+      "import re",
+      "import unicodedata",
+      "from homeassistant.const import EntityCategory, __version__ as HA_VERSION",
+      "from homeassistant.core import SupportsResponse",
+      "from homeassistant.helpers import area_registry as ar, floor_registry as fr",
+      "from homeassistant.helpers import entity_registry as er, device_registry as dr",
+      "from .const import DOMAIN"
+    ]
+  },
+  {
+    "path": "/config/custom_components/codex_cli/__init__.py",
+    "sha256": "4c6f2485f5b1368eaeb89f0256ad5388383538d491ae49730aa7f41f6301aedc",
+    "syntax": "PASS",
+    "imports": [
+      "from __future__ import annotations",
+      "from dataclasses import dataclass",
+      "from typing import Any",
+      "import voluptuous as vol",
+      "from homeassistant.config_entries import ConfigEntry",
+      "from homeassistant.const import Platform",
+      "from homeassistant.core import HomeAssistant, ServiceCall",
+      "from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError, ServiceValidationError",
+      "from homeassistant.helpers import config_validation as cv",
+      "from homeassistant.helpers.aiohttp_client import async_get_clientsession",
+      "from homeassistant.helpers.storage import Store",
+      "from .api import CodexCliApiClient, CodexCliApiError",
+      "from .const import ATTR_PROMPT, ATTR_REPLY, ATTR_TASK_ID, ATTR_TURN_ID, ATTR_FORCE, CONF_BASE_URL, DOMAIN, SERVICE_CANCEL_TASK, SERVICE_CONTINUE_TASK, SERVICE_GET_LOGIN_STATUS, SERVICE_GET_TASK, SERVICE_LOGOUT, SERVICE_LIST_TASKS, SERVICE_REPLY_TASK, SERVICE_START_LOGIN, SERVICE_START_TASK",
+      "from .coordinator import CodexCliCoordinator",
+      "from .discovery import async_discover_worker",
+      "from .notification_actions import async_listen_for_choices",
+      "from .browser_auth import STORAGE_KEY, BrowserSessions, BrowserSessionView, DiagnosticView",
+      "from .registry_services import async_register_registry_services",
+      "from homeassistant.core import SupportsResponse"
+    ]
+  },
+  {
+    "path": "/config/custom_components/codex_cli/const.py",
+    "sha256": "f1b393522033a47a4c5e308b93828867f69c2da5dd9818bf239468bd32815bb0",
+    "syntax": "PASS",
+    "imports": [
+      "from __future__ import annotations",
+      "from typing import Final"
+    ]
+  },
+  {
+    "path": "/config/custom_components/codex_cli/services.yaml",
+    "sha256": "eef863fc100e3390b22ddb6c4c6eba849b7f975bcc22a05b15581c2c79ea76a5"
+  }
+]

@@ -1,0 +1,76 @@
+#include <tunables/global>
+
+profile codex_cli_worker flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  file,
+  network,
+  signal (send) set=(kill,term,int,hup,cont),
+  signal (receive),
+
+  /init ix,
+  /run.sh rix,
+  /server.py r,
+
+  /bin/** rix,
+  /sbin/** rix,
+  /usr/bin/** rix,
+  /usr/sbin/** rix,
+  /usr/local/bin/** rix,
+
+  # The wrapper forces capability removal before a sandboxed command starts.
+  # Only the trusted Bubblewrap setup binary enters the capability-bearing
+  # child profile; the worker and Codex processes remain in this parent profile.
+  /opt/codex-sandbox/bwrap rix,
+  /opt/codex-sandbox/bwrap.real cx,
+
+  /lib/** mr,
+  /usr/lib/** mr,
+  /usr/local/lib/** mr,
+  /usr/lib/chromium/** rixm,
+  /usr/share/** r,
+  /etc/** r,
+
+  /package/** rix,
+  /command/** rix,
+  /usr/lib/bashio/** rix,
+  /run/ r,
+  /run/** rwk,
+
+  /data/ rw,
+  /data/** rwk,
+  /config/ rw,
+  /config/** rwk,
+  /tmp/ rw,
+  /tmp/** rwk,
+
+  /proc/** r,
+  /dev/null rw,
+  /dev/random r,
+  /dev/tty rw,
+  /dev/urandom r,
+
+  profile /opt/codex-sandbox/bwrap.real flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+
+    file,
+    network netlink raw,
+    capability net_admin,
+    capability sys_admin,
+    capability sys_chroot,
+    capability setgid,
+    capability setuid,
+    mount,
+    umount,
+    pivot_root,
+    signal,
+
+    /bin/** rix,
+    /sbin/** rix,
+    /usr/bin/** rix,
+    /usr/sbin/** rix,
+    /usr/local/bin/** rix,
+    /opt/codex-sandbox/bwrap.real rix,
+    /config/** rix,
+  }
+}

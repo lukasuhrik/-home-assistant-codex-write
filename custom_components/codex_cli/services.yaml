@@ -1,0 +1,293 @@
+start_task:
+  fields:
+    prompt:
+      required: true
+      selector:
+        text:
+          multiline: true
+
+start_login:
+  fields:
+    force:
+      required: false
+      default: false
+      selector:
+        boolean:
+
+get_login_status:
+
+logout:
+
+get_task:
+  fields:
+    task_id:
+      required: true
+      selector:
+        text:
+
+list_tasks:
+  fields:
+    limit:
+      selector:
+        number:
+          min: 1
+          max: 500
+          mode: box
+    offset:
+      selector:
+        number:
+          min: 0
+          mode: box
+    status:
+      selector:
+        select:
+          options: [queued, running, waiting_for_input, completed, failed, cancelled]
+    order:
+      selector:
+        select:
+          options: [created_asc, updated_desc]
+    summary:
+      selector:
+        boolean:
+
+cancel_task:
+  fields:
+    task_id:
+      required: true
+      selector:
+        text:
+
+reply_task:
+  fields:
+    task_id:
+      required: true
+      selector:
+        text:
+    reply:
+      required: true
+      selector:
+        text:
+          multiline: true
+    turn_id:
+      required: false
+      selector:
+        text:
+
+continue_task:
+  fields:
+    task_id:
+      required: true
+      selector:
+        text:
+    message:
+      required: true
+      selector:
+        text:
+          multiline: true
+
+area_get:
+  name: Area Get
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    area_id: &id001
+      description: Area ID; supply exactly one of area_id or area_name.
+      required: false
+      selector:
+        text: {}
+    area_name: &id002
+      description: Existing Area name; normalized exact match. Not the new name.
+      required: false
+      selector:
+        text: {}
+area_create:
+  name: Area Create
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    name:
+      description: New Area name.
+      required: true
+      selector: &id003
+        text: {}
+    floor_id: &id004
+      description: Floor ID; omit to preserve, YAML null to remove.
+      required: false
+      selector:
+        text: {}
+    icon: &id005
+      description: 'mdi: icon; YAML null to clear.'
+      required: false
+      selector:
+        text: {}
+    aliases: &id006
+      description: List of aliases; empty list clears.
+      selector:
+        object: {}
+area_update:
+  name: Area Update
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    area_id: *id001
+    area_name: *id002
+    name:
+      description: New Area name.
+      required: false
+      selector: *id003
+    floor_id: *id004
+    icon: *id005
+    aliases: *id006
+area_set_temperature_entity:
+  name: Area Set Temperature Entity
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    area_id: *id001
+    area_name: *id002
+    entity_id:
+      description: Environmental temperature sensor in this Area; YAML null clears
+        the preference.
+      required: true
+      selector:
+        text: {}
+floor_get:
+  name: Floor Get
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    floor_id: &id007
+      description: Floor ID; supply exactly one of floor_id or floor_name.
+      required: false
+      selector:
+        text: {}
+    floor_name: &id008
+      description: Existing Floor name; normalized exact match. Not the new name.
+      required: false
+      selector:
+        text: {}
+floor_create:
+  name: Floor Create
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    name:
+      description: New Floor name.
+      required: true
+      selector: &id009
+        text: {}
+    level: &id010
+      description: Integer level; null is supported only on create.
+      selector:
+        number:
+          mode: box
+          min: -100
+          max: 100
+    icon: &id011
+      description: 'mdi: icon; YAML null to clear.'
+      required: false
+      selector:
+        text: {}
+    aliases: &id012
+      description: List of aliases; empty list clears.
+      selector:
+        object: {}
+floor_update:
+  name: Floor Update
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    floor_id: *id007
+    floor_name: *id008
+    name:
+      description: New Floor name.
+      required: false
+      selector: *id009
+    level: *id010
+    icon: *id011
+    aliases: *id012
+entity_registry_get:
+  name: Entity Registry Get
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    entity_id:
+      description: Existing entity registry entity_id.
+      required: true
+      selector:
+        text: {}
+entity_registry_update:
+  name: Entity Registry Update
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    entity_id:
+      description: Existing entity registry entity_id.
+      required: true
+      selector:
+        text: {}
+    name:
+      description: User metadata override; omit to preserve, YAML null to clear.
+      required: false
+      selector:
+        text: {}
+    icon:
+      description: User metadata override; omit to preserve, YAML null to clear.
+      required: false
+      selector:
+        text: {}
+    area_id:
+      description: User metadata override; omit to preserve, YAML null to clear.
+      required: false
+      selector:
+        text: {}
+    disabled_by:
+      description: user or YAML null only; integration-owned reasons are rejected.
+      required: false
+      selector:
+        text: {}
+    hidden_by:
+      description: user or YAML null only.
+      required: false
+      selector:
+        text: {}
+    entity_category:
+      description: config, diagnostic or YAML null.
+      required: false
+      selector:
+        text: {}
+device_registry_get:
+  name: Device Registry Get
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    device_id:
+      description: Existing device registry ID.
+      required: true
+      selector:
+        text: {}
+device_registry_update:
+  name: Device Registry Update
+  description: Core 2026.9.4 registry metadata. Active HA admin required; no restart
+    or delete. Returns structured status when response is requested.
+  fields:
+    device_id:
+      description: Existing main device registry ID.
+      required: true
+      selector:
+        text: {}
+    name_by_user:
+      description: User metadata override; omit to preserve, YAML null to clear.
+      required: false
+      selector:
+        text: {}
+    area_id:
+      description: User metadata override; omit to preserve, YAML null to clear.
+      required: false
+      selector:
+        text: {}
+    disabled_by:
+      description: user or YAML null only.
+      required: false
+      selector:
+        text: {}

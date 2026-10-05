@@ -1,0 +1,83 @@
+rules:
+  action-setup: done
+  appropriate-polling: done
+  brands: done
+  common-modules: done
+  config-flow: done
+  dependency-transparency: done
+  docs-actions: done
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  entity-event-setup:
+    status: exempt
+    comment: Entities do not subscribe to external events.
+  entity-unique-id: done
+  has-entity-name: done
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry: done
+
+  action-exceptions: done
+  config-entry-unloading: done
+  docs-configuration-parameters: done
+  docs-installation-parameters: done
+  entity-unavailable: done
+  integration-owner:
+    status: exempt
+    comment: Private custom integration maintained locally, not submitted to Home Assistant Core.
+  log-when-unavailable: done
+  parallel-updates:
+    status: exempt
+    comment: Entities share one DataUpdateCoordinator and do not perform platform-level parallel updates.
+  reauthentication-flow: done
+
+  devices: done
+  diagnostics: done
+  discovery:
+    status: exempt
+    comment: The worker is a local add-on API and is not discoverable on the network.
+  discovery-update-info:
+    status: exempt
+    comment: There is no discovery source to update network information from.
+  docs-data-update: done
+  docs-examples: done
+  docs-known-limitations: done
+  docs-supported-devices: done
+  docs-supported-functions: done
+  docs-troubleshooting: done
+  docs-use-cases: done
+  dynamic-devices:
+    status: exempt
+    comment: The integration represents one configured local worker.
+  entity-category: done
+  entity-device-class: done
+  entity-disabled-by-default:
+    status: exempt
+    comment: The integration exposes only a small set of diagnostic entities.
+  entity-translations: done
+  stale-devices:
+    status: exempt
+    comment: The integration represents one configured local worker device.
+
+  async-dependency: done
+  inject-websession: done
+
+  config-flow-test-coverage:
+    status: todo
+    comment: Add pytest coverage before considering a Core-quality submission.
+  test-coverage:
+    status: todo
+    comment: Add full pytest coverage before considering a Core-quality submission.
+  exception-translations:
+    status: todo
+    comment: Service action exceptions are functional but not translated yet.
+  icon-translations:
+    status: todo
+    comment: Entities use static icons; icon translations have not been added.
+  reconfiguration-flow: done
+  repair-issues: done
+  strict-typing:
+    status: todo
+    comment: Type annotations are present for integration code, but strict mypy coverage is not configured.

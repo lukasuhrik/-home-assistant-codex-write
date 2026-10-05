@@ -1,0 +1,148 @@
+name: HAIPC2 release
+on:
+  push:
+    branches: [main]
+    paths:
+      - codex_cli_worker_trusted/**
+      - custom_components/codex_cli/**
+      - registry-tests/**
+      - bridge-tests/**
+      - requirements-test.txt
+      - scripts/**
+      - .github/workflows/haipc2.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: haipc2-release
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/lukasuhrik/codex-cli-worker-trusted
+  VERSION: 0.1.70-haipc2
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r requirements-test.txt
+      - run: python scripts/validate_candidate.py
+      - run: python -B -m unittest discover -s registry-tests
+      - run: python -B -m unittest discover -s bridge-tests
+        env:
+          HA_BRIDGE_REAL_IPC_TEST: '1'
+      - run: python -B -m unittest discover -s codex_cli_worker_trusted/tests
+  preflight:
+    needs: tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require a new release tag
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >existing.txt 2>inspect-error.txt; then
+            echo "Release tag already exists; refusing overwrite"
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found|name unknown' inspect-error.txt; then
+            echo "Cannot confirm tag absence; refusing publication"
+            exit 1
+          fi
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        id: build
+        with:
+          context: codex_cli_worker_trusted
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=ghcr.io/home-assistant/base:3.24
+            BUILD_VERSION=0.1.70-haipc2
+            BUILD_ARCH=${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/lukasuhrik/-home-assistant-codex-write
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=0.1.70-haipc2
+          outputs: type=image,name=ghcr.io/lukasuhrik/codex-cli-worker-trusted,push-by-digest=true,name-canonical=true,push=true
+      - name: Record architecture digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH.txt"
+          printf '%s digest: %s\n' "$ARCH" "$DIGEST"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*.txt
+          retention-days: 30
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - name: Publish new immutable release
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >existing.txt 2>inspect-error.txt; then
+            echo "Release tag already exists; refusing overwrite"
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found|name unknown' inspect-error.txt; then
+            echo "Cannot confirm tag absence; refusing publication"
+            exit 1
+          fi
+          amd64_digest="$(cat digests/amd64.txt)"
+          arm64_digest="$(cat digests/aarch64.txt)"
+          [[ "$amd64_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE@$amd64_digest" "$IMAGE@$arm64_digest"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" > release-inspect.txt
+          cat release-inspect.txt
+          printf 'amd64 digest: %s\narm64 digest: %s\n' "$amd64_digest" "$arm64_digest"
