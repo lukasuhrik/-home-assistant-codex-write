@@ -1,0 +1,119 @@
+name: Trusted HA Bridge Build
+
+on:
+  push:
+    branches: [ "rc/mvp-write-v1" ]
+    paths:
+      - "patches/trusted-ha-bridge.patch"
+      - "patches/trusted-ha-bridge.sha256"
+      - ".github/workflows/trusted-ha-bridge-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/moryoav/home-assistant-codex.git
+  UPSTREAM_SHA: 06ee7b0b77455119a0ffcbc79217e6ccda8a7128
+  VERSION: 0.1.70-haipc1
+  IMAGE: ghcr.io/lukasuhrik/codex-cli-worker-trusted
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify bridge patch checksum
+        run: (cd patches && sha256sum -c trusted-ha-bridge.sha256)
+
+      - name: Checkout pinned upstream
+        run: |
+          git clone --filter=blob:none "$UPSTREAM_REPO" upstream
+          git -C upstream checkout --detach "$UPSTREAM_SHA"
+          test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_SHA"
+
+      - name: Apply bridge patch
+        run: |
+          git -C upstream apply --check ../patches/trusted-ha-bridge.patch
+          git -C upstream apply ../patches/trusted-ha-bridge.patch
+
+      - name: Python dependencies
+        run: python -m pip install --upgrade flask pyyaml qrcode requests websocket-client pytest
+
+      - name: Compile bridge and worker
+        run: |
+          python -m py_compile             upstream/codex-cli-worker/server.py             upstream/codex-cli-worker/verification.py             upstream/codex-cli-worker/trusted_ha_bridge.py             upstream/codex-cli-worker/ha-codex-ha
+
+      - name: Real IPC bridge tests
+        env:
+          HA_BRIDGE_REAL_IPC_TEST: "1"
+        working-directory: upstream
+        run: python -B -m unittest discover -s bridge-tests
+
+      - name: Worker regression tests
+        working-directory: upstream
+        run: python -m pytest -q codex-cli-worker/tests/test_server.py codex-cli-worker/tests/test_verification.py codex-cli-worker/tests/test_config_check.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            suffix: amd64
+          - platform: linux/arm64
+            arch: aarch64
+            suffix: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned upstream
+        run: |
+          git clone --filter=blob:none "$UPSTREAM_REPO" upstream
+          git -C upstream checkout --detach "$UPSTREAM_SHA"
+          git -C upstream apply ../patches/trusted-ha-bridge.patch
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push architecture image
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream/codex-cli-worker
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ matrix.suffix }}
+          build-args: |
+            BUILD_VERSION=${{ env.VERSION }}
+            BUILD_ARCH=${{ matrix.arch }}
+            CODEX_VERSION=0.160.0
+          provenance: true
+          sbom: true
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multiarch manifest
+        run: |
+          docker buildx imagetools create             -t "$IMAGE:$VERSION"             "$IMAGE:$VERSION-amd64"             "$IMAGE:$VERSION-aarch64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" | tee image-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trusted-ha-bridge-image-manifest
+          path: image-manifest.txt
