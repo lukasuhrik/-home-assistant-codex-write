@@ -1,0 +1,22 @@
+{
+  "name": "MVP WRITE V1",
+  "version": "0.1.70+write1",
+  "protocol_version": 1,
+  "source_path": "/config/dev/mvp-write-v1",
+  "export_timestamp_utc": "2026-10-05T16:36:11.338452+00:00",
+  "upstream_target": {
+    "repository": "moryoav/home-assistant-codex",
+    "tag": "v0.1.70",
+    "commit": "06ee7b0b77455119a0ffcbc79217e6ccda8a7128"
+  },
+  "ha_core_target": {
+    "tag": "2026.9.4",
+    "commit": "9212531f40a0b7b23229a90d688dd79d9dfccff4"
+  },
+  "baseline_status": "VERIFIED_AGAINST_UPSTREAM_FOR_ALL_BASELINE_FILES",
+  "tests": {"count":58,"status":"PASS","failures":0,"errors":0,"kind":"existing isolated mocks/stubs"},
+  "production_changes": false,
+  "patch_sha256": "29f495ec3041d861851804122cfad97db27b3974838780b8ba46aa3f930948d6",
+  "patch_bytes": 70527,
+  "patch_format": "git-compatible unified diff"
+}
