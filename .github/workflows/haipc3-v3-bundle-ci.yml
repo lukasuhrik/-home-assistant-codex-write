@@ -76,7 +76,8 @@ jobs:
         working-directory: candidate
         run: |
           python -m pip install -r requirements-test.txt
-          python -c "import aiohttp; assert aiohttp.__version__ == '3.14.4'"
+          python -m pip install pytest-socket==0.8.1
+          python -c "import aiohttp, pytest_socket; assert aiohttp.__version__ == '3.14.4'"
 
       - name: Prepare pinned HA integration test environment
         working-directory: candidate
