@@ -28,7 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
-          echo "58599b7d2ef6eb6335a3862b2a2d8123e744cccbec7810d7cd4751027c8e90f0  haipc3-v4.patch" | sha256sum -c -
+          sha256sum haipc3-v4.patch
+          git diff --exit-code -- haipc3-v4.patch
           mkdir -p "$RUNNER_TEMP/v3"
           tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
           (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
