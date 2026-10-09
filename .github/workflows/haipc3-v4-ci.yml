@@ -1,0 +1,114 @@
+name: HAIPC3 V4 HAOS proc fallback CI
+
+on:
+  push:
+    branches: [haipc3-v4-test]
+    paths:
+      - haipc3-v4.patch
+      - .github/workflows/haipc3-v4-ci.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: haipc3-v4-ci
+  cancel-in-progress: true
+
+jobs:
+  test-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Verify reviewed inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
+          echo "58599b7d2ef6eb6335a3862b2a2d8123e744cccbec7810d7cd4751027c8e90f0  haipc3-v4.patch" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/v3"
+          tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
+          (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
+
+      - name: Checkout pinned HAIPC2 base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: 1781aec92cfb8bbb26a62119512b6652257c5761
+          path: candidate
+          persist-credentials: false
+
+      - name: Reconstruct HAIPC3 V4 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a "$RUNNER_TEMP/v3/files/." candidate/
+          rm -f candidate/codex_cli_worker_trusted/ha-codex-ha
+          cd candidate
+          git apply --check ../haipc3-v4.patch
+          git apply ../haipc3-v4.patch
+          test "$(git rev-parse HEAD)" = "1781aec92cfb8bbb26a62119512b6652257c5761"
+          grep -q '^version: "0.1.71-haipc3"$' codex_cli_worker_trusted/config.yaml
+          grep -q '^  registry_write_enabled: false$' codex_cli_worker_trusted/config.yaml
+          test ! -e codex_cli_worker_trusted/ha-codex-ha
+
+      - name: Checkout pinned HAIPC2 baseline
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: 1781aec92cfb8bbb26a62119512b6652257c5761
+          path: baseline
+          persist-credentials: false
+
+      - name: Move baseline outside candidate
+        run: mv baseline "$RUNNER_TEMP/haipc2-baseline"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+
+      - name: Install worker test dependencies
+        working-directory: candidate
+        run: |
+          python -m pip install -r requirements-test.txt
+          python -m pip install pytest-socket==0.8.1
+          python -c "import aiohttp, pytest_socket; assert aiohttp.__version__ == '3.14.4'"
+
+      - name: Prepare pinned HA integration test environment
+        working-directory: candidate
+        run: |
+          python -m venv "$RUNNER_TEMP/haipc3-ha-tests"
+          "$RUNNER_TEMP/haipc3-ha-tests/bin/python" -m pip install -r requirements-ha-test.txt
+          "$RUNNER_TEMP/haipc3-ha-tests/bin/python" -m pip check
+          "$RUNNER_TEMP/haipc3-ha-tests/bin/python" -c "import importlib.metadata as m; assert m.version('homeassistant') == '2026.9.4'; assert m.version('pytest-homeassistant-custom-component') == '0.13.367'; assert m.version('aiohttp') == '3.14.3'"
+          "$RUNNER_TEMP/haipc3-ha-tests/bin/python" codex_cli_worker_trusted/tests/install_frontend_test_deps.py
+          "$RUNNER_TEMP/haipc3-ha-tests/bin/python" -m pip check
+
+      - name: Prepare pinned Playwright and Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/haipc3-browser" --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          "$RUNNER_TEMP/haipc3-browser/node_modules/.bin/playwright" install --with-deps chromium
+          browser_path="$(node -e 'console.log(require(process.argv[1]).chromium.executablePath())' "$RUNNER_TEMP/haipc3-browser/node_modules/playwright-core")"
+          test -x "$browser_path"
+          echo "HA_BROWSER_EXECUTABLE=$browser_path" >> "$GITHUB_ENV"
+
+      - name: Run focused V4 regression tests
+        working-directory: candidate/codex_cli_worker_trusted
+        run: |
+          PYTHONPATH=tests:. python -B -m unittest             tests.test_bwrap             tests.test_managed_isolation             tests.test_sandbox_readiness             tests.test_server
+
+      - name: Run full HAIPC3 CI gate
+        working-directory: candidate
+        run: python -B scripts/haipc3_gate.py
+        env:
+          HAIPC2_BASELINE_DIR: ${{ runner.temp }}/haipc2-baseline
+          HAIPC3_HA_TEST_PYTHON: ${{ runner.temp }}/haipc3-ha-tests/bin/python
+          HA_BROWSER_NODE: '1'
+          NODE_PATH: ${{ runner.temp }}/haipc3-browser/node_modules
+
+      - name: Record remaining live gate
+        run: |
+          echo "LIVE HAOS ISOLATION TEST REQUIRED: YES; writes remain disabled"
