@@ -9,11 +9,11 @@
 -  # arguments at the first separator so task payloads can never match.
 -  as_pid_1=0 user_ns=0 pid_ns=0 ipc_ns=0 proc_mount=0
 -  new_session=0 die_with_parent=0
-+  # Codex's internal compatibility probe is harmless and ends in exactly
-+  # `-- /[usr/]bin/true`. Require only the security-significant probe shape
-+  # that is stable across CLI 0.160.0 container variants: fresh user + PID
-+  # namespaces and an attempted fresh /proc. Extra probe flags may vary.
-+  # Real task payloads cannot match because the command must be exactly true.
++  # Codex's internal compatibility probe ends in exactly `-- /[usr/]bin/true`.
++  # Require the stable security-significant shape (fresh user/PID namespaces
++  # plus an attempted /proc mount). Extra diagnostic flags may vary between
++  # CLI/container builds. Real task payloads cannot match because the command
++  # after `--` must be exactly true.
 +  user_ns=0 pid_ns=0 proc_mount=0
    while [ "$#" -gt 0 ]; do
      case "$1" in
@@ -37,19 +37,18 @@
            *) return 1 ;;
 --- a/codex_cli_worker_trusted/command_guard.py
 +++ b/codex_cli_worker_trusted/command_guard.py
-@@ -1,4 +1,10 @@
+@@ -1,4 +1,9 @@
 -"""Require fresh proc/network namespaces; never expose IPC to commands."""
 +"""Require isolated user/PID/network namespaces; never expose IPC to commands.
 +
-+Codex 0.160.0 falls back to retaining the container procfs when a fresh /proc
-+mount is denied by the outer HAOS/AppArmor container. That fallback is accepted
-+only with fresh user + PID namespaces; the runtime isolation probe separately
-+proves that parent secret environments are not readable through inherited procfs.
++Codex 0.160.0 may fall back to retaining the container procfs when HAOS/AppArmor
++rejects a nested fresh /proc mount. The runtime isolation probe must still prove
++that secret process environments are not readable before any task is accepted.
 +"""
  import os
  import sys
  
-@@ -14,8 +20,11 @@
+@@ -14,8 +19,11 @@
      options, command = args[:split], args[split + 1:]
      if not command or "--unshare-pid" not in options:
          raise ValueError("Fresh PID namespace required")
@@ -57,9 +56,9 @@
 -        raise ValueError("Inherited proc forbidden")
 +    if "--unshare-user" not in options:
 +        raise ValueError("Fresh user namespace required")
-+    # A fresh /proc is preferred when HAOS permits it. Codex's documented
-+    # compatibility fallback omits --proc after the probe is denied. Do not
-+    # synthesize a proc mount here: HAOS/AppArmor is the authority that denied it.
++    # A fresh /proc is preferred when the outer HAOS container permits it.
++    # If Codex omits --proc after its compatibility probe is denied, keep the
++    # inherited procfs but rely on the end-to-end secret isolation gate.
      extra = ["--unshare-net", "--cap-drop", "ALL"]
      for name in ("HA_VERIFICATION_CAPABILITY", "SUPERVISOR_TOKEN", "HASSIO_TOKEN", "HA_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"):
          extra.extend(["--unsetenv", name])
@@ -75,31 +74,30 @@
  image: ghcr.io/lukasuhrik/codex-cli-worker-trusted
 --- a/codex_cli_worker_trusted/server.py
 +++ b/codex_cli_worker_trusted/server.py
-@@ -643,7 +643,14 @@
+@@ -643,7 +643,13 @@
  
  
  def sandbox_readiness() -> dict[str, Any]:
 -    """No task may run without managed constraints AND actual isolation."""
-+    """No task may run without managed constraints AND actual Codex isolation.
++    """No task may run without managed constraints and verified Codex isolation.
 +
-+    A fresh /proc mount is a diagnostic, not an authorization boundary. HAOS may
-+    deny that mount while Codex safely falls back to fresh user/PID namespaces
-+    with inherited procfs. Readiness therefore requires the real Codex execution
-+    path plus the secret-isolation probe; a failed standalone /proc mount remains
-+    visible as telemetry but does not override a passing end-to-end isolation gate.
++    HAOS may deny a nested fresh /proc mount. That diagnostic is recorded but is
++    not itself an authorization boundary. Readiness instead requires basic
++    user/PID namespace support, a successful real Codex sandbox command, and the
++    end-to-end secret-isolation probe.
 +    """
      mode = str(read_options().get("codex_sandbox") or DEFAULT_OPTIONS["codex_sandbox"])
      binary = shutil.which("bwrap") or ""
      policy = requirements_status()
-@@ -652,13 +659,22 @@
+@@ -652,13 +658,21 @@
      proc_probe = {"ok": False, "error": "Fresh proc probe not run"}
      isolation = {"ok": False, "error": "Isolation probe not run"}
      if not unsupported and policy["ok"] and binary:
 -        namespace_probe = _bubblewrap_probe(binary, mount_proc=True, codex_mode=mode)
 -        if namespace_probe.get("namespace_ok", namespace_probe["ok"]):
-+        # Probe basic namespace support without requiring the optional fresh /proc.
-+        namespace_probe = _bubblewrap_probe(binary, mount_proc=False)
-+        if namespace_probe["ok"]:
++        raw_namespace = _bubblewrap_probe(binary, mount_proc=False)
++        namespace_probe = raw_namespace
++        if raw_namespace["ok"]:
 +            codex_probe = _codex_sandbox_probe(mode)
 +            namespace_probe = {
 +                "ok": bool(codex_probe["ok"]),
@@ -107,7 +105,6 @@
 +                "namespace_ok": True,
 +                "codex_probe": codex_probe,
 +            }
-+            # Record whether HAOS permits a fresh /proc, but do not gate on it.
              proc_probe = _bubblewrap_probe(binary, mount_proc=True)
 -        if namespace_probe["ok"] and proc_probe["ok"]:
 -            isolation = sandbox_isolation_probe()
@@ -122,7 +119,7 @@
          "namespace_probe": namespace_probe, "proc_probe": proc_probe, "isolation_probe": isolation,
 --- a/codex_cli_worker_trusted/tests/test_bwrap.py
 +++ b/codex_cli_worker_trusted/tests/test_bwrap.py
-@@ -130,9 +130,10 @@
+@@ -130,7 +130,7 @@
  
              [*PROBE[:separator + 1], "/bin/sh", "-c", " ".join(PROBE)],
          ]
@@ -130,10 +127,7 @@
 +        for flag in ("--unshare-user", "--unshare-pid"):
              cases.append([arg for arg in PROBE if arg != flag])
          proc_index = PROBE.index("--proc")
-+        cases.append(PROBE[:proc_index] + PROBE[proc_index + 2:])
          for args in cases:
-             with self.subTest(args=args):
-                 result, record = self.run_wrapper(args, exit_code=19)
 --- a/codex_cli_worker_trusted/tests/test_managed_isolation.py
 +++ b/codex_cli_worker_trusted/tests/test_managed_isolation.py
 @@ -57,6 +57,7 @@
@@ -155,7 +149,7 @@
 -        self.assertIn(["--unsetenv", "HA_VERIFICATION_CAPABILITY"], [hardened[i:i+2] for i in range(len(hardened))])
 -        self.assertNotIn("--bind", hardened)
 -        self.assertEqual(hardened[-2:], ["--", "/bin/true"])
-+    def test_guard_accepts_codex_no_proc_fallback_with_fresh_user_and_pid(self):
++    def test_guard_accepts_verified_no_proc_fallback_and_drops_capability(self):
 +        for args in (
 +            ["--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--proc", "/proc", "--", "/bin/true"],
 +            ["--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--", "/bin/true"],
@@ -174,13 +168,14 @@
          self.assertFalse(any(isinstance(n, ast.Import) and any(a.name == "subprocess" for a in n.names) for n in ast.walk(tree)))
 --- a/codex_cli_worker_trusted/tests/test_sandbox_readiness.py
 +++ b/codex_cli_worker_trusted/tests/test_sandbox_readiness.py
-@@ -97,56 +97,65 @@
+@@ -97,58 +97,74 @@
          self.assertNotIn(secret, result["error"])
          self.assertNotIn("\n", result["error"])
  
 -    def readiness(self, results: list[subprocess.CompletedProcess], mode: str = "workspace-write") -> dict:
 -        """Return the readiness report when the probe commands give these results in order; all must be used."""
-+    def readiness(self, raw_results: list[subprocess.CompletedProcess], codex: subprocess.CompletedProcess = None, isolation_ok: bool = True, mode: str = "workspace-write") -> dict:
++    def readiness(self, raw_results: list[subprocess.CompletedProcess], codex: subprocess.CompletedProcess = None,
++                  isolation_ok: bool = True, mode: str = "workspace-write") -> dict:
 +        """Return readiness with explicit raw namespace/proc, Codex and isolation outcomes."""
 +        codex = codex or completed()
          with (
@@ -204,7 +199,6 @@
 -        result = self.readiness([completed(), completed(), completed(1, "proc denied")])
 -        self.assertFalse(result["ready"])
 +    def test_proc_denial_is_diagnostic_when_real_codex_and_isolation_pass(self) -> None:
-+        """HAOS may deny fresh /proc; end-to-end Codex isolation is the gate."""
 +        result = self.readiness([completed(), completed(1, "proc denied")])
 +        self.assertTrue(result["ready"])
          self.assertTrue(result["namespace_probe"]["codex_probe"]["ok"])
@@ -223,7 +217,6 @@
 -                self.assertTrue(result["namespace_probe"]["namespace_ok"])
 -                self.assertIn("Codex failed", result["message"])
 +    def test_broken_codex_fallback_blocks_even_when_raw_namespace_works(self) -> None:
-+        """A failed actual Codex sandbox still blocks readiness."""
 +        result = self.readiness([completed()], codex=completed(1, "Codex failed"))
 +        self.assertFalse(result["ready"])
 +        self.assertFalse(result["namespace_probe"]["codex_probe"]["ok"])
@@ -263,13 +256,22 @@
 +        isolation.assert_not_called()
  
      def test_danger_mode_does_not_run_any_probe(self) -> None:
--        """Danger mode is rejected and no probe runs."""
+         """Danger mode is rejected and no probe runs."""
 -        result = self.readiness([], "danger-full-access")
-+        with patch.object(server.subprocess, "run") as run:
-+            result = self.readiness([], mode="danger-full-access")
++        with (
++            patch.object(server, "read_options", return_value={"codex_sandbox": "danger-full-access"}),
++            patch.object(server, "requirements_status", return_value={"ok":True,"error":""}),
++            patch.object(server, "_bubblewrap_probe") as raw,
++            patch.object(server, "_codex_sandbox_probe") as codex_probe,
++        ):
++            result = server.sandbox_readiness()
          self.assertFalse(result["ready"])
          self.assertTrue(result["required"])
++        raw.assert_not_called()
++        codex_probe.assert_not_called()
  
+ 
+ if __name__ == "__main__":
 --- a/codex_cli_worker_trusted/tests/test_server.py
 +++ b/codex_cli_worker_trusted/tests/test_server.py
 @@ -358,12 +358,13 @@
@@ -279,7 +281,7 @@
 -    def test_workspace_sandbox_rejects_no_proc_fallback(self) -> None:
 -        """Fresh proc failure blocks readiness without a fallback."""
 +    def test_workspace_sandbox_accepts_verified_no_proc_fallback(self) -> None:
-+        """Fresh proc denial is allowed only when real Codex and isolation both pass."""
++        """Fresh proc denial is allowed only when real Codex and isolation pass."""
          with (
              patch.object(server, "read_options", return_value={"codex_sandbox": "workspace-write"}),
              patch.object(server.shutil, "which", return_value="/usr/bin/bwrap"),
