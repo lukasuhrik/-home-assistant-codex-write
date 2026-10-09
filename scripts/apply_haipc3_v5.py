@@ -136,6 +136,13 @@ block = '''    def test_guard_accepts_verified_no_proc_fallback_and_drops_capabi
 '''
 p.write_text(text[:start] + block + text[end:], encoding="utf-8")
 
+# V4 treats the exact /usr/bin/true shape as an internal compatibility probe.
+# Keep the near-match test non-probe so it exercises the normal guarded path.
+p = W / "tests/test_bwrap.py"
+text = p.read_text(encoding="utf-8")
+text = text.replace('[*PROBE[:-1], "true"],', '[*PROBE[:-1], "/bin/echo"],', 1)
+p.write_text(text, encoding="utf-8")
+
 # V4's bwrap test expected no-proc to be refused by command_guard. In V5 it
 # must reach the guarded real-bwrap path while missing PID/user still refuses.
 p = W / "tests/test_bwrap.py"
