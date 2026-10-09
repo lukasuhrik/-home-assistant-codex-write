@@ -4,7 +4,7 @@ on:
   push:
     branches: [haipc3-v4-test]
     paths:
-      - haipc3-v4.patch
+      - scripts/apply_haipc3_v4.py
       - .github/workflows/haipc3-v4-ci.yml
 
 permissions:
@@ -28,8 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
-          sha256sum haipc3-v4.patch
-          git diff --exit-code -- haipc3-v4.patch
+          python -m py_compile scripts/apply_haipc3_v4.py
+          git diff --exit-code -- scripts/apply_haipc3_v4.py
           mkdir -p "$RUNNER_TEMP/v3"
           tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
           (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
@@ -48,9 +48,9 @@ jobs:
           set -euo pipefail
           cp -a "$RUNNER_TEMP/v3/files/." candidate/
           rm -f candidate/codex_cli_worker_trusted/ha-codex-ha
+          cp scripts/apply_haipc3_v4.py candidate/scripts/apply_haipc3_v4.py
           cd candidate
-          git apply --check ../haipc3-v4.patch
-          git apply ../haipc3-v4.patch
+          python scripts/apply_haipc3_v4.py
           test "$(git rev-parse HEAD)" = "1781aec92cfb8bbb26a62119512b6652257c5761"
           grep -q '^version: "0.1.71-haipc3"$' codex_cli_worker_trusted/config.yaml
           grep -q '^  registry_write_enabled: false$' codex_cli_worker_trusted/config.yaml
@@ -99,7 +99,11 @@ jobs:
       - name: Run focused V4 regression tests
         working-directory: candidate/codex_cli_worker_trusted
         run: |
-          PYTHONPATH=tests:. python -B -m unittest             tests.test_bwrap             tests.test_managed_isolation             tests.test_sandbox_readiness             tests.test_server
+          PYTHONPATH=tests:. python -B -m unittest \
+            tests.test_bwrap \
+            tests.test_managed_isolation \
+            tests.test_sandbox_readiness \
+            tests.test_server
 
       - name: Run full HAIPC3 CI gate
         working-directory: candidate
