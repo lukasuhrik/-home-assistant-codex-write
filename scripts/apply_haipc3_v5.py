@@ -141,6 +141,7 @@ p.write_text(text[:start] + block + text[end:], encoding="utf-8")
 p = W / "tests/test_bwrap.py"
 text = p.read_text(encoding="utf-8")
 text = text.replace('[*PROBE[:-1], "true"],', '[*PROBE[:-1], "/bin/echo"],', 1)
+text = text.replace('            [arg for arg in PROBE if arg != "--unshare-user"],\n', '', 1)
 p.write_text(text, encoding="utf-8")
 
 # V4's bwrap test expected no-proc to be refused by command_guard. In V5 it
@@ -150,18 +151,21 @@ text = p.read_text(encoding="utf-8")
 start = text.index("    def test_probe_lookalikes_missing_required_isolation_are_refused")
 end = text.index("\n    def test_version_and_help_remain_usable", start)
 block = '''    def test_probe_missing_pid_is_refused_but_no_proc_fallback_uses_guarded_path(self) -> None:
-        missing_pid = [arg for arg in PROBE if arg != "--unshare-pid"]
-        if self.record.exists():
-            self.record.unlink()
-        result = subprocess.run(
-            [str(self.wrapper), *missing_pid],
-            env={**os.environ, "TEST_RECORD": str(self.record),
-                 "TEST_STDERR": PROC_ERROR.hex(), "TEST_EXIT": "19"},
-            capture_output=True, timeout=5, check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b"Command isolation unavailable", result.stderr)
-        self.assertFalse(self.record.exists())
+        for args in (
+            [arg for arg in PROBE if arg != "--unshare-pid"],
+            [arg for arg in PROBE if arg != "--unshare-user"],
+        ):
+            if self.record.exists():
+                self.record.unlink()
+            result = subprocess.run(
+                [str(self.wrapper), *args],
+                env={**os.environ, "TEST_RECORD": str(self.record),
+                     "TEST_STDERR": PROC_ERROR.hex(), "TEST_EXIT": "19"},
+                capture_output=True, timeout=5, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"Command isolation unavailable", result.stderr)
+            self.assertFalse(self.record.exists())
 
         proc_index = PROBE.index("--proc")
         no_proc = PROBE[:proc_index] + PROBE[proc_index + 2:]
