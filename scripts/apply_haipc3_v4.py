@@ -110,14 +110,18 @@ new_readiness = '''def sandbox_readiness() -> dict[str, Any]:
 '''
 replace("codex_cli_worker_trusted/server.py", old_readiness, new_readiness)
 
-replace(
-    "codex_cli_worker_trusted/tests/test_managed_isolation.py",
-    '''             patch.object(server, "_bubblewrap_probe", return_value={"ok":True,"error":""}), \
-             patch.object(server, "sandbox_isolation_probe", return_value={"ok":False,"error":"isolation failed"}):''',
-    '''             patch.object(server, "_bubblewrap_probe", return_value={"ok":True,"error":""}), \
-             patch.object(server, "_codex_sandbox_probe", return_value={"ok":True,"error":""}), \
-             patch.object(server, "sandbox_isolation_probe", return_value={"ok":False,"error":"isolation failed"}):''',
+p = W / "tests/test_managed_isolation.py"
+text = p.read_text(encoding="utf-8")
+anchor = '             patch.object(server, "_bubblewrap_probe", return_value={"ok":True,"error":""}), \\\n'
+needle = '             patch.object(server, "sandbox_isolation_probe", return_value={"ok":False,"error":"isolation failed"}):'
+if anchor + needle not in text:
+    raise SystemExit("expected managed isolation anchors not found")
+text = text.replace(
+    anchor + needle,
+    anchor + '             patch.object(server, "_codex_sandbox_probe", return_value={"ok":True,"error":""}), \\\n' + needle,
+    1,
 )
+p.write_text(text, encoding="utf-8")
 
 p = W / "tests/test_sandbox_readiness.py"
 text = p.read_text(encoding="utf-8")
