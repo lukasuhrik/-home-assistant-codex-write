@@ -275,3 +275,58 @@ for rel in (
     py_compile.compile(str(ROOT / rel), doraise=True)
 
 print("HAIPC3 V4 transform applied")
+
+# Refine probe regression expectations after the base transform.
+p = W / "tests/test_bwrap.py"
+text = p.read_text(encoding="utf-8")
+start = text.index("    def test_real_commands_and_lookalikes_bypass_helper")
+end = text.index("\n    def test_version_and_help_remain_usable", start)
+block = '''    def test_real_commands_and_lookalikes_bypass_helper(self) -> None:
+        """Real commands and true probe near-matches stay on the normal guarded path."""
+        separator = PROBE.index("--")
+        cases = [
+            [*PROBE[:separator + 1], "/usr/local/bin/codex", "--apply-seccomp-then-exec", "--", "/bin/true"],
+            [*PROBE, "extra"], [*PROBE[:-1], "true"],
+            [*PROBE[:separator + 1], "/bin/sh", "-c", " ".join(PROBE)],
+            [arg for arg in PROBE if arg != "--unshare-user"],
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                result, record = self.run_wrapper(args, exit_code=19)
+                self.assertEqual(result.stderr, PROC_ERROR)
+                self.assertEqual(result.returncode, 19)
+                self.assertEqual(record["args"][:args.index("--")], args[:args.index("--")])
+                self.assertIn(["--unsetenv", "HA_VERIFICATION_CAPABILITY"], [record["args"][i:i+2] for i in range(len(record["args"]))])
+
+    def test_probe_variants_with_stable_isolation_shape_are_normalized(self) -> None:
+        """Nonessential diagnostic flags may vary; stable user/PID/proc shape is sufficient."""
+        for flag in ("--as-pid-1", "--new-session", "--die-with-parent", "--unshare-ipc"):
+            args = [arg for arg in PROBE if arg != flag]
+            with self.subTest(flag=flag):
+                result, record = self.run_wrapper(args, exit_code=17)
+                self.assertEqual(result.returncode, 17)
+                self.assertEqual(result.stderr, RECOGNIZED_ERROR)
+                self.assertEqual(record["args"], ["--cap-drop", "ALL", *args])
+
+    def test_probe_lookalikes_missing_required_isolation_are_refused(self) -> None:
+        """Missing PID namespace or fresh /proc must never be normalized."""
+        proc_index = PROBE.index("--proc")
+        cases = [
+            [arg for arg in PROBE if arg != "--unshare-pid"],
+            PROBE[:proc_index] + PROBE[proc_index + 2:],
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                if self.record.exists():
+                    self.record.unlink()
+                result = subprocess.run(
+                    [str(self.wrapper), *args],
+                    env={**os.environ, "TEST_RECORD": str(self.record),
+                         "TEST_STDERR": PROC_ERROR.hex(), "TEST_EXIT": "19"},
+                    capture_output=True, timeout=5, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Command isolation unavailable", result.stderr)
+                self.assertFalse(self.record.exists())
+'''
+p.write_text(text[:start] + block + text[end:], encoding="utf-8")
