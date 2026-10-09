@@ -47,6 +47,17 @@ replace(
     'version: "0.1.71-haipc3"',
 )
 
+replace(
+    "codex_cli_worker_trusted/verification_mcp.py",
+    '"version": "0.1.70-haipc3"',
+    '"version": "0.1.71-haipc3"',
+)
+replace(
+    "scripts/validate_candidate.py",
+    "assert config['version'] == '0.1.70-haipc3'",
+    "assert config['version'] == '0.1.71-haipc3'",
+)
+
 old_readiness = '''def sandbox_readiness() -> dict[str, Any]:
     """No task may run without managed constraints AND actual isolation."""
     mode = str(read_options().get("codex_sandbox") or DEFAULT_OPTIONS["codex_sandbox"])
