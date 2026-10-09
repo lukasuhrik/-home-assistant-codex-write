@@ -1,6 +1,6 @@
 name: Codex CLI Worker Trusted HA Bridge
 description: Codex CLI worker with a finite trusted Home Assistant registry bridge.
-version: "0.1.70-haipc2"
+version: "0.1.70-haipc3"
 slug: codex_cli_worker_trusted
 url: https://github.com/lukasuhrik/-home-assistant-codex-write
 image: ghcr.io/lukasuhrik/codex-cli-worker-trusted
@@ -25,6 +25,7 @@ hassio_role: default
 backup_exclude:
   - "*/ha-docs*"
 options:
+  registry_write_enabled: false
   codex_model: default
   model_reasoning_effort: medium
   reasoning_summary: concise
@@ -40,10 +41,11 @@ options:
   local_docs: true
   ha_url: http://homeassistant:8123
 schema:
+  registry_write_enabled: bool
   codex_model: list(default|gpt-6-astra|gpt-6.1-sol|gpt-6-sol|gpt-6-luna|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5)
   model_reasoning_effort: list(minimal|low|medium|high|xhigh)
   reasoning_summary: list(concise|detailed|none)
-  codex_sandbox: list(workspace-write|danger-full-access|read-only)
+  codex_sandbox: list(workspace-write|read-only)
   task_root: str
   notify_service: str?
   task_timeout_seconds: int
