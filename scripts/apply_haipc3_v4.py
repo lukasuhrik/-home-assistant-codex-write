@@ -97,8 +97,8 @@ new_readiness = '''def sandbox_readiness() -> dict[str, Any]:
                 "namespace_ok": True,
                 "codex_probe": codex_probe,
             }
-            proc_probe = _bubblewrap_probe(binary, mount_proc=True)
             if codex_probe["ok"]:
+                proc_probe = _bubblewrap_probe(binary, mount_proc=True)
                 isolation = sandbox_isolation_probe()
     ready = bool(not unsupported and policy["ok"] and namespace_probe["ok"] and isolation["ok"])
     errors = [item.get("error") for item in (policy, namespace_probe, isolation) if not item["ok"]]
@@ -227,20 +227,42 @@ block = '''    def test_workspace_sandbox_accepts_proc_telemetry_failure_only_af
 '''
 p.write_text(text[:start] + block + text[end:], encoding="utf-8")
 
-replace(
-    "codex_cli_worker_trusted/tests/test_bwrap.py",
-    '''        for flag in ("--as-pid-1", "--new-session", "--die-with-parent", "--unshare-user", "--unshare-ipc"):
+p = W / "tests/test_bwrap.py"
+text = p.read_text(encoding="utf-8")
+start = text.index("    def test_real_commands_and_lookalikes_bypass_helper")
+end = text.index("\n    def test_version_and_help_remain_usable", start)
+block = '''    def test_real_commands_and_lookalikes_bypass_helper(self) -> None:
+        """Real commands and non-isolation probe lookalikes stay on the normal guarded path."""
+        separator = PROBE.index("--")
+        cases = [
+            [*PROBE[:separator + 1], "/usr/local/bin/codex", "--apply-seccomp-then-exec", "--", "/bin/true"],
+            [*PROBE, "extra"], [*PROBE[:-1], "true"],
+            [*PROBE[:separator + 1], "/bin/sh", "-c", " ".join(PROBE)],
+        ]
+        for flag in ("--as-pid-1", "--new-session", "--die-with-parent", "--unshare-ipc"):
             cases.append([arg for arg in PROBE if arg != flag])
-        proc_index = PROBE.index("--proc")
         for args in cases:
-''',
-    '''        for flag in ("--unshare-user", "--unshare-pid"):
-            cases.append([arg for arg in PROBE if arg != flag])
+            with self.subTest(args=args):
+                result, record = self.run_wrapper(args, exit_code=19)
+                self.assertEqual(result.stderr, PROC_ERROR)
+                self.assertEqual(result.returncode, 19)
+                self.assertEqual(record["args"][:args.index("--")], args[:args.index("--")])
+                self.assertIn(["--unsetenv", "HA_VERIFICATION_CAPABILITY"], [record["args"][i:i+2] for i in range(len(record["args"]))])
+
+    def test_probe_lookalikes_missing_required_isolation_are_refused(self) -> None:
+        """Missing PID namespace or fresh /proc must never be normalized into a successful-looking probe."""
         proc_index = PROBE.index("--proc")
-        cases.append(PROBE[:proc_index] + PROBE[proc_index + 2:])
+        cases = [
+            [arg for arg in PROBE if arg != "--unshare-pid"],
+            PROBE[:proc_index] + PROBE[proc_index + 2:],
+        ]
         for args in cases:
-''',
-)
+            with self.subTest(args=args):
+                result, _ = self.run_wrapper(args, exit_code=19)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Command isolation unavailable", result.stderr)
+'''
+p.write_text(text[:start] + block + text[end:], encoding="utf-8")
 
 # Ensure Python syntax before CI.
 import py_compile
