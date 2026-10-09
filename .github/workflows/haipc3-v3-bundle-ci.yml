@@ -4,6 +4,7 @@ on:
     branches: [haipc3-ci-test]
     paths:
       - haipc3-ci-source-bundle-v3.tar.gz
+      - .github/workflows/haipc3-v3-bundle-ci.yml
 
 permissions:
   contents: read
@@ -114,4 +115,5 @@ jobs:
           NODE_PATH: ${{ runner.temp }}/haipc3-browser/node_modules
 
       - name: Record remaining live gate
-        run: echo "LIVE HAOS ISOLATION TEST REQUIRED: YES; no build/publish/install"
+        run: |
+          echo "LIVE HAOS ISOLATION TEST REQUIRED: YES; no build/publish/install"
