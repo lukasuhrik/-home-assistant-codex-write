@@ -101,6 +101,10 @@ wrapper.chmod(0o755)
 # Add regression asserting a descriptor-backed normal command survives wrapper.
 p = W / "tests/test_bwrap.py"
 text = p.read_text(encoding="utf-8")
+text = text.replace(
+    '                self.assertEqual(record["args"][:args.index("--")], args[:args.index("--")])\n',
+    '                self.assertEqual(record["args"][-len(args):], args)\n'
+)
 marker = "\n    def test_probe_preserves_signal_termination"
 idx = text.index(marker)
 extra = '''
