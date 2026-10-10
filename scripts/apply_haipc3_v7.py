@@ -120,11 +120,13 @@ p = W / "Dockerfile"
 text = p.read_text(encoding="utf-8")
 old = '''COPY codex-bwrap /opt/codex-sandbox/bwrap
 COPY codex-bwrap-probe.py /opt/codex-sandbox/codex-bwrap-probe.py
+COPY command_guard.py /opt/codex-sandbox/command_guard.py
 
 RUN chmod 0755 /opt/codex-sandbox/bwrap
 '''
 new = '''COPY codex-bwrap.c /tmp/codex-bwrap.c
 COPY codex-bwrap-probe.py /opt/codex-sandbox/codex-bwrap-probe.py
+COPY command_guard.py /opt/codex-sandbox/command_guard.py
 
 RUN apk add --no-cache --virtual .codex-build-deps build-base \
     && cc -O2 -Wall -Wextra -o /opt/codex-sandbox/bwrap /tmp/codex-bwrap.c \
