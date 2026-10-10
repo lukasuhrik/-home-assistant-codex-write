@@ -111,4 +111,5 @@ jobs:
           NODE_PATH: ${{ runner.temp }}/haipc3-browser/node_modules
 
       - name: Record live gate
-        run: echo "LIVE HAOS ISOLATION TEST REQUIRED: YES; writes remain disabled"
+        run: |
+          echo "LIVE HAOS ISOLATION TEST REQUIRED: YES; writes remain disabled"
