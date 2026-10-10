@@ -138,6 +138,7 @@ jobs:
           cp v9-transform/scripts/apply_haipc3_v5.py candidate/scripts/apply_haipc3_v5.py
           cp v9-transform/scripts/apply_haipc3_v6.py candidate/scripts/apply_haipc3_v6.py
           cp v9-transform/scripts/apply_haipc3_v7.py candidate/scripts/apply_haipc3_v7.py
+          cp v9-transform/scripts/apply_haipc3_v8.py candidate/scripts/apply_haipc3_v8.py
           cp v9-transform/scripts/apply_haipc3_v9.py candidate/scripts/apply_haipc3_v9.py
           cd candidate
           python scripts/apply_haipc3_v9.py
