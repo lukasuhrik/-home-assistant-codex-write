@@ -1,0 +1,211 @@
+name: HAIPC3 V6 release
+
+on:
+  push:
+    branches: [haipc3-v6-test]
+    paths:
+      - .github/workflows/haipc3-v5-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: haipc3-v5-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/lukasuhrik/codex-cli-worker-trusted
+  VERSION: 0.1.73-haipc3
+  BASE_SHA: 1781aec92cfb8bbb26a62119512b6652257c5761
+  V3_BUNDLE_SHA: 7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0
+  V6_TRANSFORM_REF: f885c664a13a25041749bfdf42b46236b117a31f
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify reviewed V3 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$V3_BUNDLE_SHA  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/v3"
+          tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
+          (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: ${{ env.V6_TRANSFORM_REF }}
+          path: v6-transform
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - name: Reconstruct exact CI-passed V6 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a "$RUNNER_TEMP/v3/files/." candidate/
+          rm -f candidate/codex_cli_worker_trusted/ha-codex-ha
+          cp v6-transform/scripts/apply_haipc3_v4.py candidate/scripts/apply_haipc3_v4.py
+          cp v6-transform/scripts/apply_haipc3_v6.py candidate/scripts/apply_haipc3_v6.py
+          cd candidate
+          python scripts/apply_haipc3_v6.py
+          grep -q '^version: "0.1.73-haipc3"$' codex_cli_worker_trusted/config.yaml
+          grep -q '^  registry_write_enabled: false$' codex_cli_worker_trusted/config.yaml
+          ! grep -q 'danger-full-access' codex_cli_worker_trusted/config.yaml
+          test ! -e codex_cli_worker_trusted/ha-codex-ha
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require new immutable release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >existing.txt 2>inspect-error.txt; then
+            echo "Release tag already exists; refusing overwrite"
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found|name unknown' inspect-error.txt; then
+            cat inspect-error.txt
+            echo "Cannot confirm tag absence; refusing publication"
+            exit 1
+          fi
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify and extract reviewed V3 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$V3_BUNDLE_SHA  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/v3"
+          tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
+          (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: ${{ env.V6_TRANSFORM_REF }}
+          path: v6-transform
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: lukasuhrik/-home-assistant-codex-write
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - name: Reconstruct exact CI-passed V6 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a "$RUNNER_TEMP/v3/files/." candidate/
+          rm -f candidate/codex_cli_worker_trusted/ha-codex-ha
+          cp v6-transform/scripts/apply_haipc3_v4.py candidate/scripts/apply_haipc3_v4.py
+          cp v6-transform/scripts/apply_haipc3_v6.py candidate/scripts/apply_haipc3_v6.py
+          cd candidate
+          python scripts/apply_haipc3_v6.py
+          grep -q '^version: "0.1.73-haipc3"$' codex_cli_worker_trusted/config.yaml
+          grep -q '^  registry_write_enabled: false$' codex_cli_worker_trusted/config.yaml
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        id: build
+        with:
+          context: candidate/codex_cli_worker_trusted
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=ghcr.io/home-assistant/base:3.24
+            BUILD_VERSION=0.1.73-haipc3
+            BUILD_ARCH=${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/lukasuhrik/-home-assistant-codex-write
+            org.opencontainers.image.revision=${{ env.V6_TRANSFORM_REF }}
+            org.opencontainers.image.version=0.1.73-haipc3
+          outputs: type=image,name=ghcr.io/lukasuhrik/codex-cli-worker-trusted,push-by-digest=true,name-canonical=true,push=true
+      - name: Record architecture digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH.txt"
+          printf '%s digest: %s\n' "$ARCH" "$DIGEST"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v6-digest-${{ matrix.arch }}
+          path: digests/*.txt
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: v6-digest-*
+          path: digests
+          merge-multiple: true
+      - name: Publish immutable multiarch V6 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >existing.txt 2>inspect-error.txt; then
+            echo "Release tag already exists; refusing overwrite"
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found|name unknown' inspect-error.txt; then
+            cat inspect-error.txt
+            echo "Cannot confirm tag absence; refusing publication"
+            exit 1
+          fi
+          amd64_digest="$(cat digests/amd64.txt)"
+          arm64_digest="$(cat digests/aarch64.txt)"
+          [[ "$amd64_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE@$amd64_digest" "$IMAGE@$arm64_digest"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" > release-inspect.txt
+          cat release-inspect.txt
+          printf 'amd64 digest: %s\narm64 digest: %s\n' "$amd64_digest" "$arm64_digest"
