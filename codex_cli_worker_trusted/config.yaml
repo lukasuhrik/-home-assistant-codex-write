@@ -1,6 +1,6 @@
 name: Codex CLI Worker Trusted HA Bridge
 description: Codex CLI worker with a finite trusted Home Assistant registry bridge.
-version: "0.1.75-haipc3"
+version: "0.1.76-haipc3"
 slug: codex_cli_worker_trusted
 url: https://github.com/lukasuhrik/-home-assistant-codex-write
 image: ghcr.io/lukasuhrik/codex-cli-worker-trusted
