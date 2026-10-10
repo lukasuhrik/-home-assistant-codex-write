@@ -5,7 +5,7 @@ on:
     branches: [haipc3-v7-test]
     paths:
       - scripts/apply_haipc3_v7.py
-      - .github/workflows/haipc3-v6-ci.yml
+      - .github/workflows/haipc3-v7-ci.yml
 
 permissions:
   contents: read
@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
-          python -m py_compile scripts/apply_haipc3_v4.py scripts/apply_haipc3_v5.py scripts/apply_haipc3_v7.py
+          python -m py_compile scripts/apply_haipc3_v4.py scripts/apply_haipc3_v5.py scripts/apply_haipc3_v6.py scripts/apply_haipc3_v7.py
           mkdir -p "$RUNNER_TEMP/v3"
           tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
           (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
