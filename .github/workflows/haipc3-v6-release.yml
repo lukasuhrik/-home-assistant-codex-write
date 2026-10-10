@@ -4,13 +4,13 @@ on:
   push:
     branches: [haipc3-v6-test]
     paths:
-      - .github/workflows/haipc3-v5-release.yml
+      - .github/workflows/haipc3-v6-release.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: haipc3-v5-release
+  group: haipc3-v6-release
   cancel-in-progress: false
 
 env:
@@ -57,6 +57,7 @@ jobs:
           cp -a "$RUNNER_TEMP/v3/files/." candidate/
           rm -f candidate/codex_cli_worker_trusted/ha-codex-ha
           cp v6-transform/scripts/apply_haipc3_v4.py candidate/scripts/apply_haipc3_v4.py
+          cp v6-transform/scripts/apply_haipc3_v5.py candidate/scripts/apply_haipc3_v5.py
           cp v6-transform/scripts/apply_haipc3_v6.py candidate/scripts/apply_haipc3_v6.py
           cd candidate
           python scripts/apply_haipc3_v6.py
