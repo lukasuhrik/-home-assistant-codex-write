@@ -1,17 +1,17 @@
-name: HAIPC3 V8 isolation-shape CI
+name: HAIPC3 V9 safe-diagnostics CI
 
 on:
   push:
-    branches: [haipc3-v8-test]
+    branches: [haipc3-v9-test]
     paths:
-      - scripts/apply_haipc3_v8.py
+      - scripts/apply_haipc3_v9.py
       - .github/workflows/haipc3-v7-ci.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: haipc3-v8-ci
+  group: haipc3-v9-ci
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "7df75e6a222ebf08412e142525fb41f9b5a83884d8a1128e4301ce2124945db0  haipc3-ci-source-bundle-v3.tar.gz" | sha256sum -c -
-          python -m py_compile scripts/apply_haipc3_v4.py scripts/apply_haipc3_v5.py scripts/apply_haipc3_v6.py scripts/apply_haipc3_v7.py scripts/apply_haipc3_v8.py
+          python -m py_compile scripts/apply_haipc3_v4.py scripts/apply_haipc3_v5.py scripts/apply_haipc3_v6.py scripts/apply_haipc3_v7.py scripts/apply_haipc3_v8.py scripts/apply_haipc3_v9.py
           mkdir -p "$RUNNER_TEMP/v3"
           tar -xzf haipc3-ci-source-bundle-v3.tar.gz -C "$RUNNER_TEMP/v3"
           (cd "$RUNNER_TEMP/v3" && sha256sum -c SHA256SUMS)
@@ -41,7 +41,7 @@ jobs:
           path: candidate
           persist-credentials: false
 
-      - name: Reconstruct V8 candidate
+      - name: Reconstruct V9 candidate
         shell: bash
         run: |
           set -euo pipefail
@@ -52,9 +52,10 @@ jobs:
           cp scripts/apply_haipc3_v6.py candidate/scripts/apply_haipc3_v6.py
           cp scripts/apply_haipc3_v7.py candidate/scripts/apply_haipc3_v7.py
           cp scripts/apply_haipc3_v8.py candidate/scripts/apply_haipc3_v8.py
+          cp scripts/apply_haipc3_v9.py candidate/scripts/apply_haipc3_v9.py
           cd candidate
-          python scripts/apply_haipc3_v8.py
-          grep -q '^version: "0.1.75-haipc3"$' codex_cli_worker_trusted/config.yaml
+          python scripts/apply_haipc3_v9.py
+          grep -q '^version: "0.1.76-haipc3"$' codex_cli_worker_trusted/config.yaml
           grep -q '^  registry_write_enabled: false$' codex_cli_worker_trusted/config.yaml
           ! grep -q 'danger-full-access' codex_cli_worker_trusted/config.yaml
           test ! -e codex_cli_worker_trusted/ha-codex-ha
@@ -94,7 +95,7 @@ jobs:
           browser_path="$(node -e 'console.log(require(process.argv[1]).chromium.executablePath())' "$RUNNER_TEMP/haipc3-browser/node_modules/playwright-core")"
           echo "HA_BROWSER_EXECUTABLE=$browser_path" >> "$GITHUB_ENV"
 
-      - name: Run focused V8 regressions
+      - name: Run focused V9 regressions
         working-directory: candidate/codex_cli_worker_trusted
         run: |
           PYTHONPATH=tests:. python -B -m unittest \
